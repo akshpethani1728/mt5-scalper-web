@@ -392,14 +392,10 @@ with tab2:
 
 with tab3:
     st.header("🔴 Live Scanner")
-    st.warning("Live mode refreshes automatically every 30 seconds.")
-    placeholder = st.empty()
-    while True:
-        signal = scan_for_signal(symbol)
-        if signal:
-            color = "green" if signal['signal'] == 'BUY' else "red"
-            placeholder.success(f"🎯 **{signal['signal']}** on **{signal['symbol']}** @ `{signal['entry']:.5f}` | SL: `{signal['sl']:.5f}` | TP: `{signal['tp']:.5f}` | RSI: `{signal['rsi']:.1f}`")
-        else:
-            placeholder.info("⚪ No signal at this time.")
-        time.sleep(30)
-        st.rerun()
+    st.info("Click '🔄 Refresh' to check for new signals. Auto-refresh every 30s.")
+    signal = scan_for_signal(symbol)
+    if signal:
+        color = "green" if signal['signal'] == 'BUY' else "red"
+        st.success(f"🎯 **{signal['signal']}** on **{signal['symbol']}** @ `{signal['entry']:.5f}` | SL: `{signal['sl']:.5f}` | TP: `{signal['tp']:.5f}` | RSI: `{signal['rsi']:.1f}` | ATR: `{signal['atr']:.5f}`")
+    else:
+        st.info("⚪ No signal at this time.")
