@@ -1,15 +1,16 @@
 """
 MT5 Scalper Pro — Real-Time Trading Assistant
 =============================================
-Multi-strategy scalping dashboard with 5 strategies including Micro Scalp for high-frequency M1 trading.
+Multi-strategy scalping dashboard with 6 strategies including Micro Scalp & Quick Scalp for high-frequency M1 trading.
 Features:
-  - TradingView-style chart (no zoom, pan only)
-  - 5 strategies: Pullback EMA, EMA Crossover, RSI Range, ATR Breakout, Micro Scalp
+  - TradingView-style chart (no zoom, pan only, double-click/annotation editing disabled)
+  - 6 strategies: Pullback EMA, EMA Crossover, RSI Range, ATR Breakout, Micro Scalp, Quick Scalp
   - MT5 signal file export (JSON for Expert Advisor import)
   - Scanner with sound alerts + browser notifications
-  - Detailed single-pair backtest with equity/drawdown/P&L charts
+  - Detailed single-pair backtest with session/duration/session breakdown, best/worst trade, equity/drawdown/P&L charts
   - Session filter (London + New York)
   - Yahoo Finance v8 REST API + SDK fallback
+  - Real trading risk & position size calculator
 """
 
 import streamlit as st
@@ -42,7 +43,7 @@ TF_INTERVAL = {"M1": "1m", "M5": "5m", "H1": "60m"}
 TF_PERIOD = {"M1": "5d", "M5": "5d", "H1": "60d"}
 TF_LABEL = {"M1": "1 Min", "M5": "5 Min", "H1": "1 Hr"}
 
-# Chart layout defaults — TradingView style (pan only, no zoom)
+# Chart layout defaults — TradingView style (pan only, no zoom, no edit)
 CHART_LAYOUT = dict(
     template='plotly_dark',
     showlegend=True,
@@ -52,6 +53,8 @@ CHART_LAYOUT = dict(
     dragmode='pan',
     hovermode='x unified',
     margin=dict(l=40, r=20, t=40, b=40),
+    doubleClick=False,
+    editable=False,
 )
 
 # ============================================================================
@@ -121,6 +124,19 @@ STRATEGIES = {
             "use_tp_fixed": True, "tp_pips": 8.0,
         }
     },
+    "Quick Scalp": {
+        "description": "⚡⚡ Ultra-fast EMA2/5 cross within EMA8 trend. Minimal SL (0.3×ATR). Fixed 4-6 pip TP. No session filter. Designed for 3-10+ trades per hour on M1.",
+        "params": {
+            "ema_fast": 2, "ema_slow": 5,
+            "ema_trend_fast": 8, "ema_trend_slow": 20,
+            "rsi_period": 4, "atr_period": 3,
+            "sl_atr_mult": 0.3, "sl_min_atr": 0.15,
+            "min_trend_dist_pct": 0.00001, "min_atr_pct": 0.000005,
+            "candle_body_min": 0.20, "min_score": 20,
+            "cooldown": 0, "swing_lookback": 1,
+            "use_tp_fixed": True, "tp_pips": 5.0,
+        }
+    },
 }
 DEFAULT_STRATEGY = "Pullback EMA"
 
@@ -139,6 +155,7 @@ def init_session():
         "pinned_symbol": "EURUSD",
         "alert_config": {"min_score": 50, "min_rr": 0.8, "sound_enabled": True, "pairs": ALL_PAIRS[:4]},
         "mt5_signal": None,
+        "scanner_symbol": "EURUSD",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -321,6 +338,8 @@ def find_signal(df, idx, strategy, params):
         return _sig_atr_breakout(df, idx, params)
     elif strategy == "Micro Scalp":
         return _sig_micro_scalp(df, idx, params)
+    elif strategy == "Quick Scalp":
+        return _sig_quick_scalp(df, idx, params)
     return None
 
 
@@ -413,7 +432,30 @@ def _sig_micro_scalp(df, idx, params):
     # Body filter (minimal)
     body = row['candle_body_pct'] if not np.isnan(row['candle_body_pct']) else 0
     if body < params['candle_body_min']: return None
-    # NO session filter for Micro Scalp — trade all day
+def _sig_quick_scalp(df, idx, params):
+    """
+    ⚡⚡ Quick Scalp: Ultra-fast EMA2/5 cross within EMA8/20 trend.
+    Maximum frequency M1 scalping with minimal SL (0.3×ATR) and fixed 5-pip TP.
+    No session filter. Designed for 3-10+ trades per hour.
+    """
+    row, prev = df.iloc[idx], df.iloc[idx - 1]
+    # EMA2 crosses EMA5 (ema_9 = EMA2, ema_21 = EMA5 via fast/slow params)
+    cross_up = prev['ema_9'] <= prev['ema_21'] and row['ema_9'] > row['ema_21']
+    cross_down = prev['ema_9'] >= prev['ema_21'] and row['ema_9'] < row['ema_21']
+    if not (cross_up or cross_down): return None
+    direction = 'BUY' if cross_up else 'SELL'
+    # Trend: EMA8 > EMA20 for BUY
+    if direction == 'BUY' and not (row['ema_20'] > row['ema_50']): return None
+    if direction == 'SELL' and not (row['ema_20'] < row['ema_50']): return None
+    # RSI momentum (minimal filter)
+    if direction == 'BUY' and not (row['rsi'] > 50): return None
+    if direction == 'SELL' and not (row['rsi'] < 50): return None
+    # Minimal ATR filter (tight SL needs some vol)
+    if row['atr_pct'] < params['min_atr_pct']: return None
+    # Minimal body filter
+    body = row['candle_body_pct'] if not np.isnan(row['candle_body_pct']) else 0
+    if body < params['candle_body_min']: return None
+    # NO session filter — trade all day
     return direction
 
 # ============================================================================
@@ -599,6 +641,21 @@ def run_backtest(symbol: str, candles: int, interval: str, strategy: str, params
     td['month'] = pd.to_datetime(td['entry_time']).dt.to_period('M')
     monthly = td.groupby('month')['pnl_pips'].agg(['sum', 'count']).reset_index()
     monthly.columns = ['month', 'pnl', 'count']
+    # Session breakdown: London 8-12, NY 13-17
+    def get_session(h):
+        if 8 <= h < 12: return 'London'
+        elif 13 <= h <= 17: return 'NewYork'
+        else: return 'Other'
+    td['session'] = td['hour'].apply(get_session)
+    session_grp = td.groupby('session')['pnl_pips'].agg(['sum', 'count', 'mean']).reset_index()
+    session_grp.columns = ['session', 'pnl', 'count', 'avg_pnl']
+    # Duration in minutes
+    td['duration_min'] = (pd.to_datetime(td['exit_time']) - pd.to_datetime(td['entry_time'])).dt.total_seconds() / 60
+    dur_bins = [0, 1, 3, 5, 15, 60, 999]
+    dur_labels = ['<1m', '1-3m', '3-5m', '5-15m', '15-60m', '>60m']
+    td['dur_bucket'] = pd.cut(td['duration_min'], bins=dur_bins, labels=dur_labels, right=True)
+    dur_grp = td.groupby('dur_bucket', observed=True)['pnl_pips'].agg(['sum', 'count', 'mean']).reset_index()
+    dur_grp.columns = ['duration', 'pnl', 'count', 'avg_pnl']
     buy_td = td[td['signal'] == 'BUY']
     sell_td = td[td['signal'] == 'SELL']
     return td, df, {
@@ -619,6 +676,17 @@ def run_backtest(symbol: str, candles: int, interval: str, strategy: str, params
         'hourly': hourly.to_dict('records'),
         'monthly': monthly.to_dict('records'),
         'trades_per_hour': round(total / (len(df) / 60), 2) if len(df) > 0 else 0,
+        # New detailed metrics
+        'session_breakdown': session_grp.to_dict('records'),
+        'duration_breakdown': dur_grp.to_dict('records'),
+        'avg_duration_min': round(td['duration_min'].mean(), 1),
+        'median_duration_min': round(td['duration_min'].median(), 1),
+        'best_trade': td.loc[td['pnl_pips'].idxmax()].to_dict() if len(td) > 0 else {},
+        'worst_trade': td.loc[td['pnl_pips'].idxmin()].to_dict() if len(td) > 0 else {},
+        'total_hours': round(len(df) / 60, 1),
+        'recovery_factor': round(abs(total_pnl / max_dd), 2) if max_dd != 0 else '∞',
+        'avg_trade_pnl': round(total_pnl / total, 2) if total > 0 else 0,
+        'sharp_ratio_like': round((td['pnl_pips'].mean() / td['pnl_pips'].std()), 2) if td['pnl_pips'].std() > 0 else 0,
     }
 
 # ============================================================================
@@ -966,6 +1034,11 @@ with st.sidebar:
         p["use_tp_fixed"] = True
         p["tp_pips"] = st.slider("Fixed TP (pips)", 3, 20, int(p.get("tp_pips", 8)), 1)
 
+    if active_strat == "Quick Scalp":
+        st.subheader("⚡⚡ Quick Scalp")
+        p["use_tp_fixed"] = True
+        p["tp_pips"] = st.slider("Fixed TP (pips)", 2, 15, int(p.get("tp_pips", 5)), 1)
+
     st.session_state["active_params"] = p
 
     st.markdown("---")
@@ -1006,6 +1079,7 @@ with tab1:
     with col_sym:
         dash_sym = st.selectbox("Symbol", ALL_PAIRS,
             index=ALL_PAIRS.index(pinned) if pinned in ALL_PAIRS else 0, key="dash_sym")
+        st.session_state["scanner_symbol"] = dash_sym
     with col_tf:
         dash_tf = st.selectbox("TF", ["M1", "M5", "H1"], index=["M1", "M5", "H1"].index(tf), key="dash_tf")
     with col_strat:
@@ -1056,7 +1130,7 @@ with tab1:
         st.markdown("---")
         fig = plot_chart(df_dash)
         if fig:
-            st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': False, 'displayModeBar': True, 'modeBarButtonsToRemove': ['lasso2d', 'select2d', 'autoScale2d', 'hoverCompareCartesian', 'toggleSpikelines']})
+            st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': False, 'displayModeBar': True, 'modeBarButtonsToRemove': ['lasso2d', 'select2d', 'autoScale2d', 'hoverCompareCartesian', 'toggleSpikelines'], 'doubleClick': False, 'editable': False})
 
         sig = scan_pair(dash_sym, dash_tf, dash_strat, dash_params)
         if sig:
@@ -1065,6 +1139,29 @@ with tab1:
             st.session_state["mt5_signal"] = generate_mt5_signal(sig, dash_params)
             # Browser beep for new signal
             st.markdown(SOUND_JS, unsafe_allow_html=True)
+
+            # ── Real Trading: Risk & Position Size Calculator ────────────────────
+            with st.expander("🧮 Risk & Position Size Calculator", expanded=False):
+                pip_val = 0.0001 if 'JPY' not in sig['symbol'] else 0.01
+                sl_pips_calc = round(abs(sig['entry'] - sig['sl']) / pip_val, 1)
+                tp_pips_calc = round(abs(sig['tp'] - sig['entry']) / pip_val, 1)
+                risk_account = st.number_input("Account Balance ($)", min_value=100.0, value=1000.0, step=50.0, key="risk_account")
+                risk_pct = st.slider("Risk per trade (%)", 0.25, 5.0, 1.0, 0.25, key="risk_pct")
+                risk_amount = risk_account * risk_pct / 100
+                position_size = round(risk_amount / (sl_pips_calc * pip_val), 2) if sl_pips_calc > 0 else 0
+                potential_profit = round(position_size * tp_pips_calc * pip_val, 2)
+                st.markdown(f"""
+                <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:10px;padding:10px;background:#1a1a2e;border-radius:10px;">
+                    <div><small>Account</small><br><b>${risk_account:,.0f}</b></div>
+                    <div><small>Risk Amount</small><br><b style="color:#f44336;">${risk_amount:.2f} ({risk_pct}%)</b></div>
+                    <div><small>SL Distance</small><br><b>{sl_pips_calc} pips</b></div>
+                    <div><small>TP Distance</small><br><b>{tp_pips_calc} pips</b></div>
+                    <div><small>Position Size</small><br><b style="color:#2196F3;">{position_size:,} units</b></div>
+                    <div><small>Potential Profit</small><br><b style="color:#4caf50;">${potential_profit:.2f}</b></div>
+                    <div><small>Risk:Reward</small><br><b>1:{sig['rr']:.1f}</b></div>
+                    <div><small>Leverage (forex)</small><br><b>~1:{int(position_size * sig['entry'] / risk_account) if position_size > 0 else 0}x</b></div>
+                </div>
+                """, unsafe_allow_html=True)
         else:
             st.info(f"⚪ No signal ({dash_strat}) | score≥{dash_params['min_score']} | ATR%≥{dash_params['min_atr_pct']:.5f} | body≥{dash_params['candle_body_min']*100:.0f}% | RSI={last['rsi']:.1f} | {trend_dir}")
 
@@ -1073,7 +1170,7 @@ with tab1:
 # ═══════════════════════════════════════════════════
 with tab2:
     st.header("📈 Backtest")
-    st.caption(f"Strategy parameters from sidebar apply | SL: ATR×{params.get('sl_atr_mult','?')} | TP: dynamic | Session: London+NY | Cooldown: {params.get('cooldown',0)}")
+    st.caption(f"Strategy parameters from sidebar apply | SL: ATR×{params.get('sl_atr_mult','?')} | TP: {'fixed ' + str(params.get('tp_pips','?')) + 'pips' if params.get('use_tp_fixed') else 'dynamic'} | Session: London+NY | Cooldown: {params.get('cooldown',0)}")
 
     bk_col1, bk_col2, bk_col3, bk_col4 = st.columns([2, 1, 1, 1])
     with bk_col1:
@@ -1100,67 +1197,122 @@ with tab2:
         if m is None:
             st.error(f"❌ No trades for {sym_b} [{tf_b}] using {strat_b}. Try: lower min_score, lower min_ATR%, more candles, or H1 TF.")
         else:
-            # Summary row 1
-            sm1, sm2, sm3, sm4, sm5 = st.columns(5)
+            # ── Row 1: Core Stats ──────────────────────────────────────────────
+            st.markdown("### 📊 Performance Summary")
+            sm1, sm2, sm3, sm4, sm5, sm6 = st.columns(6)
             sm1.metric("Total Trades", m['total'])
             sm2.metric("Win Rate", f"{m['win_rate']}%")
             sm3.metric("Profit Factor", m['profit_factor'])
             sm4.metric("Max DD", f"{m['max_drawdown']} pips")
             pnl_color = "🟢" if m['total_pnl'] > 0 else "🔴"
             sm5.metric("Net P&L", f"{m['total_pnl']} pips {pnl_color}")
+            rf = m.get('recovery_factor', '∞')
+            sm6.metric("Recovery Factor", rf)
 
-            # Summary row 2
-            sr1, sr2, sr3, sr4, sr5 = st.columns(5)
+            # ── Row 2: P&L Breakdown ───────────────────────────────────────────
+            sr1, sr2, sr3, sr4, sr5, sr6 = st.columns(6)
             sr1.metric("W / L", f"{m['wins']} / {m['losses']}")
             sr2.metric("Avg R:R", f"1:{m['avg_rr']}")
-            sr3.metric("Expectancy", f"{m['expectancy']} pips/t")
-            sr4.metric("Trades/Hour", m['trades_per_hour'])
-            sr5.metric("Avg Hold", f"{m['avg_hold']} cndls")
+            sr3.metric("Avg Win", f"{m['avg_win']} pips")
+            sr4.metric("Avg Loss", f"{m['avg_loss']} pips")
+            sr5.metric("Avg Trade", f"{m.get('avg_trade_pnl', 0)} pips")
+            sr6.metric("Expectancy", f"{m['expectancy']} pips/t")
 
-            # Summary row 3: streaks + direction
-            ss1, ss2, ss3, ss4 = st.columns(4)
+            # ── Row 3: Direction & Streaks ────────────────────────────────────
+            ss1, ss2, ss3, ss4, ss5, ss6 = st.columns(6)
             ss1.metric("Win Streak 🟢", f"×{m['max_win_streak']}")
             ss2.metric("Loss Streak 🔴", f"×{m['max_loss_streak']}")
-            ss3.metric("BUY WR", f"{m['buy_wr']}% ({m['buy_pnl']}p)")
-            ss4.metric("SELL WR", f"{m['sell_wr']}% ({m['sell_pnl']}p)")
+            ss3.metric("BUY WR", f"{m['buy_wr']}%")
+            ss4.metric("SELL WR", f"{m['sell_wr']}%")
+            ss5.metric("BUY P&L", f"{m['buy_pnl']} pips")
+            ss6.metric("SELL P&L", f"{m['sell_pnl']} pips")
 
+            # ── Row 4: Frequency & Duration ───────────────────────────────────
+            fr1, fr2, fr3, fr4, fr5, fr6 = st.columns(6)
+            fr1.metric("Trades/Hour", m['trades_per_hour'])
+            fr2.metric("Avg Hold", f"{m['avg_hold']} cndls")
+            fr3.metric("Avg Duration", f"{m.get('avg_duration_min', 0)} min")
+            fr4.metric("Median Duration", f"{m.get('median_duration_min', 0)} min")
+            fr5.metric("Total Hours", f"{m.get('total_hours', 0)} hrs")
+            fr6.metric("Sharpe-like", f"{m.get('sharp_ratio_like', 0)}")
+
+            # ── Row 5: Best / Worst ─────────────────────────────────────────────
+            bt_row, wt_row = st.columns(2)
+            best = m.get('best_trade', {})
+            worst = m.get('worst_trade', {})
+            with bt_row:
+                if best:
+                    st.markdown("##### 🏆 Best Trade")
+                    bcd = "🟢 WIN" if best.get('result') == 'WIN' else "🔴 LOSS"
+                    st.markdown(f"**{bcd}** | {best.get('pnl_pips', 0)} pips | R:R 1:{best.get('rr', 0)} | Score {best.get('score', 0)}")
+                    st.caption(f"Entry: {best.get('entry_time', '')} | {best.get('signal', '')} @ {best.get('entry', 0):.5f} → {best.get('exit', 0):.5f} | Hold: {best.get('hold_candles', 0)} cndls")
+            with wt_row:
+                if worst:
+                    st.markdown("##### 💔 Worst Trade")
+                    wcd = "🟢 WIN" if worst.get('result') == 'WIN' else "🔴 LOSS"
+                    st.markdown(f"**{wcd}** | {worst.get('pnl_pips', 0)} pips | R:R 1:{worst.get('rr', 0)} | Score {worst.get('score', 0)}")
+                    st.caption(f"Entry: {worst.get('entry_time', '')} | {worst.get('signal', '')} @ {worst.get('entry', 0):.5f} → {worst.get('exit', 0):.5f} | Hold: {worst.get('hold_candles', 0)} cndls")
+
+            # ── Session Breakdown ───────────────────────────────────────────────
+            sess_data = m.get('session_breakdown', [])
+            if sess_data:
+                st.markdown("##### 🌐 Session Breakdown (London 08-12 | NY 13-17 UTC)")
+                s_cols = st.columns(len(sess_data))
+                for i, s in enumerate(sess_data):
+                    with s_cols[i]:
+                        sess_name = s['session']
+                        sess_icon = "🟢" if s['pnl'] > 0 else "🔴" if s['pnl'] < 0 else "⚪"
+                        st.metric(f"{sess_icon} {sess_name}", f"{s['pnl']:.0f} pips", f"{s['count']} trades | avg {s['avg_pnl']:.1f}p")
+
+            # ── Duration Breakdown ──────────────────────────────────────────────
+            dur_data = m.get('duration_breakdown', [])
+            if dur_data:
+                st.markdown("##### ⏱️ Trade Duration Analysis")
+                d_cols = st.columns(len(dur_data))
+                for i, d in enumerate(dur_data):
+                    with d_cols[i]:
+                        d_pnl_color = "🟢" if d['pnl'] > 0 else "🔴" if d['pnl'] < 0 else "⚪"
+                        st.metric(f"{d['duration']}", f"{d_pnl_color} {d['pnl']:.0f}p", f"{d['count']} trades | avg {d['avg_pnl']:.1f}p")
+
+            # ── Equity & Drawdown Charts ───────────────────────────────────────
             st.markdown("---")
-            st.markdown("### 📉 Equity & Drawdown")
+            st.markdown("### 📈 Equity & Drawdown")
             eq_col, dd_col = st.columns(2)
             with eq_col:
                 eq = equity_chart(td)
                 if eq:
-                    st.plotly_chart(eq, use_container_width=True, config={'scrollZoom': False, 'displayModeBar': True, 'modeBarButtonsToRemove': ['lasso2d', 'select2d', 'autoScale2d', 'hoverCompareCartesian']})
+                    st.plotly_chart(eq, use_container_width=True, config={'scrollZoom': False, 'displayModeBar': True, 'modeBarButtonsToRemove': ['lasso2d', 'select2d', 'autoScale2d', 'hoverCompareCartesian'], 'doubleClick': False, 'editable': False})
             with dd_col:
                 dd = drawdown_chart(td)
                 if dd:
-                    st.plotly_chart(dd, use_container_width=True, config={'scrollZoom': False, 'displayModeBar': True, 'modeBarButtonsToRemove': ['lasso2d', 'select2d', 'autoScale2d', 'hoverCompareCartesian']})
+                    st.plotly_chart(dd, use_container_width=True, config={'scrollZoom': False, 'displayModeBar': True, 'modeBarButtonsToRemove': ['lasso2d', 'select2d', 'autoScale2d', 'hoverCompareCartesian'], 'doubleClick': False, 'editable': False})
 
+            # ── P&L Distribution & Hourly Returns ───────────────────────────────
             st.markdown("### 📊 P&L Distribution & Hourly Returns")
             dist_col, hr_col = st.columns(2)
             with dist_col:
                 dist = pnl_dist_chart(td)
                 if dist:
-                    st.plotly_chart(dist, use_container_width=True, config={'scrollZoom': False, 'displayModeBar': True, 'modeBarButtonsToRemove': ['lasso2d', 'select2d', 'autoScale2d', 'hoverCompareCartesian']})
+                    st.plotly_chart(dist, use_container_width=True, config={'scrollZoom': False, 'displayModeBar': True, 'modeBarButtonsToRemove': ['lasso2d', 'select2d', 'autoScale2d', 'hoverCompareCartesian'], 'doubleClick': False, 'editable': False})
             with hr_col:
                 hc = hourly_chart(m)
                 if hc:
-                    st.plotly_chart(hc, use_container_width=True, config={'scrollZoom': False, 'displayModeBar': True, 'modeBarButtonsToRemove': ['lasso2d', 'select2d', 'autoScale2d', 'hoverCompareCartesian']})
+                    st.plotly_chart(hc, use_container_width=True, config={'scrollZoom': False, 'displayModeBar': True, 'modeBarButtonsToRemove': ['lasso2d', 'select2d', 'autoScale2d', 'hoverCompareCartesian'], 'doubleClick': False, 'editable': False})
 
             st.markdown("### 📅 Monthly Returns")
             mh = monthly_heatmap(m)
             if mh:
-                st.plotly_chart(mh, use_container_width=True, config={'scrollZoom': False, 'displayModeBar': True, 'modeBarButtonsToRemove': ['lasso2d', 'select2d', 'autoScale2d', 'hoverCompareCartesian']})
+                st.plotly_chart(mh, use_container_width=True, config={'scrollZoom': False, 'displayModeBar': True, 'modeBarButtonsToRemove': ['lasso2d', 'select2d', 'autoScale2d', 'hoverCompareCartesian'], 'doubleClick': False, 'editable': False})
 
             st.markdown("### 📊 Price Chart with Trade Markers")
             if df_bt is not None and not df_bt.empty:
                 fig_bt = plot_chart(df_bt, td)
                 if fig_bt:
-                    st.plotly_chart(fig_bt, use_container_width=True, config={'scrollZoom': False, 'displayModeBar': True, 'modeBarButtonsToRemove': ['lasso2d', 'select2d', 'autoScale2d', 'hoverCompareCartesian']})
+                    st.plotly_chart(fig_bt, use_container_width=True, config={'scrollZoom': False, 'displayModeBar': True, 'modeBarButtonsToRemove': ['lasso2d', 'select2d', 'autoScale2d', 'hoverCompareCartesian'], 'doubleClick': False, 'editable': False})
 
             st.markdown(f"### 📋 Trade Log ({m['total']} trades)")
-            disp = td[['entry_time', 'signal', 'entry', 'sl', 'tp', 'rr', 'score', 'result', 'pnl_pips', 'hold_candles', 'sl_pips', 'tp_pips']].tail(50).copy()
-            disp.columns = ['Time', 'Dir', 'Entry', 'SL', 'TP', 'R:R', 'Score', 'Result', 'P&L', 'Hold', 'SL(p)', 'TP(p)']
+            disp = td[['entry_time', 'signal', 'entry', 'sl', 'tp', 'rr', 'score', 'result', 'pnl_pips', 'hold_candles', 'duration_min', 'sl_pips', 'tp_pips']].tail(50).copy()
+            disp.columns = ['Time', 'Dir', 'Entry', 'SL', 'TP', 'R:R', 'Score', 'Result', 'P&L', 'Hold(c)', 'Dur(m)', 'SL(p)', 'TP(p)']
             disp['Time'] = disp['Time'].dt.strftime('%Y-%m-%d %H:%M')
             st.dataframe(
                 disp.style.apply(
@@ -1287,7 +1439,7 @@ with tab3:
 
         # MT5 signal file download for active signals
         if signals:
-            mt5_bytes = mt5_signal_file(dash_sym if 'dash_sym' in dir() else "EURUSD", signals)
+            mt5_bytes = mt5_signal_file(st.session_state.get("scanner_symbol", "EURUSD"), signals)
             st.download_button(
                 "🤖 Export MT5 Signals (JSON)",
                 mt5_bytes,
