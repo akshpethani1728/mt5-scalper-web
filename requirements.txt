@@ -1,4 +1,5 @@
-streamlit
+streamlit>=1.35.0
+streamlit-autorefresh
 yfinance
 ta
 plotly
