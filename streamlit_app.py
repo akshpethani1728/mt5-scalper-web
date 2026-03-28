@@ -1,13 +1,13 @@
 """
 MT5 Scalper Pro — Real-Time Trading Assistant
 =============================================
-Multi-strategy scalping dashboard with EMA/RSI pullback, crossover, RSI range, and breakout strategies.
+Multi-strategy scalping dashboard with 5 strategies including Micro Scalp for high-frequency M1 trading.
 Features:
-  - TradingView embedded live chart (main feature)
-  - 4 switchable strategies: Pullback EMA, EMA Crossover, RSI Range, Breakout
-  - Detailed single-pair backtest: equity curve, drawdown, streaks, expectancy, hourly/monthly stats
-  - Multi-pair live scanner with customizable alert thresholds
-  - Auto-refresh every 10 seconds
+  - TradingView-style chart (no zoom, pan only)
+  - 5 strategies: Pullback EMA, EMA Crossover, RSI Range, ATR Breakout, Micro Scalp
+  - MT5 signal file export (JSON for Expert Advisor import)
+  - Scanner with sound alerts + browser notifications
+  - Detailed single-pair backtest with equity/drawdown/P&L charts
   - Session filter (London + New York)
   - Yahoo Finance v8 REST API + SDK fallback
 """
@@ -17,7 +17,9 @@ import pandas as pd
 import numpy as np
 import warnings
 import requests
+import json
 import plotly.graph_objects as go
+import plotly.io as pio
 from plotly.subplots import make_subplots
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -40,13 +42,25 @@ TF_INTERVAL = {"M1": "1m", "M5": "5m", "H1": "60m"}
 TF_PERIOD = {"M1": "5d", "M5": "5d", "H1": "60d"}
 TF_LABEL = {"M1": "1 Min", "M5": "5 Min", "H1": "1 Hr"}
 
+# Chart layout defaults — TradingView style (pan only, no zoom)
+CHART_LAYOUT = dict(
+    template='plotly_dark',
+    showlegend=True,
+    legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+    xaxis_rangeslider_visible=False,
+    scrollZoom=False,
+    dragmode='pan',
+    hovermode='x unified',
+    margin=dict(l=40, r=20, t=40, b=40),
+)
+
 # ============================================================================
-# STRATEGY DEFINITIONS
+# STRATEGIES
 # ============================================================================
 
 STRATEGIES = {
     "Pullback EMA": {
-        "description": "EMA9 crosses above/below EMA21 within EMA20/50 trend. RSI confirms direction. Best for ranging + trending markets.",
+        "description": "EMA9/21 pullback within EMA20/50 trend. RSI confirms. Best for ranging + trending markets.",
         "params": {
             "ema_fast": 9, "ema_slow": 21,
             "ema_trend_fast": 20, "ema_trend_slow": 50,
@@ -55,11 +69,10 @@ STRATEGIES = {
             "min_trend_dist_pct": 0.00006, "min_atr_pct": 0.00003,
             "candle_body_min": 0.50, "min_score": 60,
             "cooldown": 3, "swing_lookback": 5,
-            "min_rsi_buy_max": 50, "min_rsi_sell_min": 50,
         }
     },
     "EMA Crossover": {
-        "description": "Fast EMA crosses slow EMA. Simple momentum strategy. Works best in strong trending markets.",
+        "description": "Fast EMA crosses slow EMA. Price must be above/below EMA50. Pure momentum.",
         "params": {
             "ema_fast": 9, "ema_slow": 21,
             "ema_trend_fast": 20, "ema_trend_slow": 50,
@@ -68,11 +81,10 @@ STRATEGIES = {
             "min_trend_dist_pct": 0.00004, "min_atr_pct": 0.00002,
             "candle_body_min": 0.40, "min_score": 50,
             "cooldown": 2, "swing_lookback": 5,
-            "min_rsi_buy_max": 50, "min_rsi_sell_min": 50,
         }
     },
     "RSI Range": {
-        "description": "BUY when RSI crosses above oversold threshold (30), SELL when RSI crosses below overbought (70). Uses EMA trend filter.",
+        "description": "RSI crosses above oversold / below overbought threshold. EMA20/50 trend filter.",
         "params": {
             "ema_fast": 9, "ema_slow": 21,
             "ema_trend_fast": 20, "ema_trend_slow": 50,
@@ -82,11 +94,10 @@ STRATEGIES = {
             "candle_body_min": 0.40, "min_score": 40,
             "cooldown": 2, "swing_lookback": 5,
             "rsi_buy_max": 35, "rsi_sell_min": 65,
-            "min_rsi_buy_max": 30, "min_rsi_sell_min": 70,
         }
     },
     "ATR Breakout": {
-        "description": "Price breaks above/below EMA9 with strong ATR expansion. No RSI filter. Pure momentum + volatility strategy.",
+        "description": "Price breaks EMA9 with ATR expansion. No RSI filter. Pure momentum + volatility.",
         "params": {
             "ema_fast": 9, "ema_slow": 21,
             "ema_trend_fast": 20, "ema_trend_slow": 50,
@@ -95,16 +106,26 @@ STRATEGIES = {
             "min_trend_dist_pct": 0.00010, "min_atr_pct": 0.00005,
             "candle_body_min": 0.70, "min_score": 70,
             "cooldown": 1, "swing_lookback": 3,
-            "min_rsi_buy_max": 100, "min_rsi_sell_min": 0,
+        }
+    },
+    "Micro Scalp": {
+        "description": "⚡ High-frequency EMA3/7 cross within EMA20 trend. Tight SL (0.5×ATR). Targets 5-10 pips per trade. Designed for M1 scalping with multiple trades per hour.",
+        "params": {
+            "ema_fast": 3, "ema_slow": 7,
+            "ema_trend_fast": 20, "ema_trend_slow": 50,
+            "rsi_period": 6, "atr_period": 5,
+            "sl_atr_mult": 0.5, "sl_min_atr": 0.3,
+            "min_trend_dist_pct": 0.00002, "min_atr_pct": 0.00001,
+            "candle_body_min": 0.30, "min_score": 30,
+            "cooldown": 0, "swing_lookback": 2,
+            "use_tp_fixed": True, "tp_pips": 8.0,
         }
     },
 }
-
-# Default strategy
 DEFAULT_STRATEGY = "Pullback EMA"
 
 # ============================================================================
-# SESSION STATE INIT
+# SESSION STATE
 # ============================================================================
 
 def init_session():
@@ -114,25 +135,14 @@ def init_session():
         "last_signal_hashes": set(),
         "refresh_count": 0,
         "pair_cooldown": {},
-        "bt_result": None,          # single pair backtest result
-        "bt_strategy": DEFAULT_STRATEGY,
-        "alert_config": {
-            "min_score": 60,
-            "min_rr": 1.0,
-            "pairs": ALL_PAIRS[:4],
-        },
+        "bt_result": None,
+        "pinned_symbol": "EURUSD",
+        "alert_config": {"min_score": 50, "min_rr": 0.8, "sound_enabled": True, "pairs": ALL_PAIRS[:4]},
+        "mt5_signal": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
-
-# ============================================================================
-# CONFIG HELPERS — read from currently selected strategy
-# ============================================================================
-
-def get_strategy_params():
-    strat = st.session_state.get("active_strategy", DEFAULT_STRATEGY)
-    return STRATEGIES.get(strat, STRATEGIES[DEFAULT_STRATEGY])["params"].copy()
 
 # ============================================================================
 # DATA SOURCE
@@ -217,7 +227,7 @@ def swing_low(df, idx, lookback):
     return df['low'].iloc[max(0, idx-lookback):idx+1].min()
 
 # ============================================================================
-# SESSION / TIME HELPERS
+# SESSION HELPERS
 # ============================================================================
 
 def session_active(dt) -> bool:
@@ -244,7 +254,7 @@ def rsi_display(v):
     return f"{v:.1f} ⚪", "#9e9e9e"
 
 # ============================================================================
-# SIGNAL QUALITY SCORE
+# SIGNAL SCORE
 # ============================================================================
 
 def score_signal(df, idx, direction, params):
@@ -257,7 +267,7 @@ def score_signal(df, idx, direction, params):
     rsi_score = min(25.0, (rsi_dist / 35) * 25.0)
     body = row['candle_body_pct'] if not np.isnan(row['candle_body_pct']) else 0
     candle_score = min(25.0, (body / 0.80) * 25.0)
-    atr_ratio = row['atr_pct'] / params['min_atr_pct']
+    atr_ratio = row['atr_pct'] / (params['min_atr_pct'] + 1e-10)
     atr_score = min(20.0, max(0.0, (atr_ratio - 0.5) * 10.0))
     return round(trend + rsi_score + candle_score + atr_score, 1)
 
@@ -281,21 +291,25 @@ def calc_sl(signal, entry, df, idx, params):
     return sl
 
 def calc_tp(signal, entry, sl, df, idx, params):
+    if params.get('use_tp_fixed') and params.get('tp_pips'):
+        # Micro Scalp: fixed TP in pips
+        pip_val = 0.0001 if 'JPY' not in df.iloc[idx]['close'] else 0.01
+        tp_pips = params['tp_pips']
+        return entry + (tp_pips * pip_val) if signal == 'BUY' else entry - (tp_pips * pip_val)
+    # Dynamic TP
     atr_ratio = df.iloc[idx]['atr'] / (params['min_atr_pct'] + 1e-10)
     rr = 1.2 if atr_ratio < 1.0 else 1.35 if atr_ratio < 2.0 else 1.5
     risk = abs(entry - sl)
     return entry + (risk * rr) if signal == 'BUY' else entry - (risk * rr)
 
 # ============================================================================
-# STRATEGY SIGNAL DETECTION — unified interface
+# STRATEGY SIGNAL DETECTION
 # ============================================================================
 
-def find_signal(df: pd.DataFrame, idx: int, strategy: str, params: dict) -> str | None:
-    """Returns 'BUY', 'SELL', or None based on the selected strategy."""
+def find_signal(df, idx, strategy, params):
     if idx < 2:
         return None
-    row = df.iloc[idx]
-    prev = df.iloc[idx - 1]
+    row, prev = df.iloc[idx], df.iloc[idx - 1]
 
     if strategy == "Pullback EMA":
         return _sig_pullback_ema(df, idx, params)
@@ -305,23 +319,21 @@ def find_signal(df: pd.DataFrame, idx: int, strategy: str, params: dict) -> str 
         return _sig_rsi_range(df, idx, params)
     elif strategy == "ATR Breakout":
         return _sig_atr_breakout(df, idx, params)
+    elif strategy == "Micro Scalp":
+        return _sig_micro_scalp(df, idx, params)
     return None
 
 
-def _sig_pullback_ema(df, idx, params) -> str | None:
+def _sig_pullback_ema(df, idx, params):
     row, prev = df.iloc[idx], df.iloc[idx - 1]
     cross_up = prev['ema_9'] <= prev['ema_21'] and row['ema_9'] > row['ema_21']
     cross_down = prev['ema_9'] >= prev['ema_21'] and row['ema_9'] < row['ema_21']
-    if not (cross_up or cross_down):
-        return None
+    if not (cross_up or cross_down): return None
     direction = 'BUY' if cross_up else 'SELL'
-    # Trend filter
     if direction == 'BUY' and not (row['ema_20'] > row['ema_50']): return None
     if direction == 'SELL' and not (row['ema_20'] < row['ema_50']): return None
-    # RSI filter
     if direction == 'BUY' and not (row['rsi'] > 50 and row['rsi_change'] > 0): return None
     if direction == 'SELL' and not (row['rsi'] < 50 and row['rsi_change'] < 0): return None
-    # ATR + trend dist + body
     if row['trend_dist'] < params['min_trend_dist_pct']: return None
     if row['atr_pct'] < params['min_atr_pct']: return None
     body = row['candle_body_pct'] if not np.isnan(row['candle_body_pct']) else 0
@@ -330,17 +342,14 @@ def _sig_pullback_ema(df, idx, params) -> str | None:
     return direction
 
 
-def _sig_ema_crossover(df, idx, params) -> str | None:
+def _sig_ema_crossover(df, idx, params):
     row, prev = df.iloc[idx], df.iloc[idx - 1]
     cross_up = prev['ema_9'] <= prev['ema_21'] and row['ema_9'] > row['ema_21']
     cross_down = prev['ema_9'] >= prev['ema_21'] and row['ema_9'] < row['ema_21']
-    if not (cross_up or cross_down):
-        return None
+    if not (cross_up or cross_down): return None
     direction = 'BUY' if cross_up else 'SELL'
-    # Trend: price above EMA50 for BUY
     if direction == 'BUY' and row['close'] <= row['ema_50']: return None
     if direction == 'SELL' and row['close'] >= row['ema_50']: return None
-    # ATR + body
     if row['atr_pct'] < params['min_atr_pct']: return None
     body = row['candle_body_pct'] if not np.isnan(row['candle_body_pct']) else 0
     if body < params['candle_body_min']: return None
@@ -348,16 +357,12 @@ def _sig_ema_crossover(df, idx, params) -> str | None:
     return direction
 
 
-def _sig_rsi_range(df, idx, params) -> str | None:
+def _sig_rsi_range(df, idx, params):
     row, prev = df.iloc[idx], df.iloc[idx - 1]
-    # BUY: RSI crosses above oversold threshold
     rsi_cross_up = prev['rsi'] < params.get('rsi_buy_max', 35) and row['rsi'] >= params.get('rsi_buy_max', 35)
-    # SELL: RSI crosses below overbought threshold
     rsi_cross_down = prev['rsi'] > params.get('rsi_sell_min', 65) and row['rsi'] <= params.get('rsi_sell_min', 65)
-    if not (rsi_cross_up or rsi_cross_down):
-        return None
+    if not (rsi_cross_up or rsi_cross_down): return None
     direction = 'BUY' if rsi_cross_up else 'SELL'
-    # Trend filter: EMA20 > EMA50 for BUY
     if direction == 'BUY' and not (row['ema_20'] > row['ema_50']): return None
     if direction == 'SELL' and not (row['ema_20'] < row['ema_50']): return None
     if row['atr_pct'] < params['min_atr_pct']: return None
@@ -365,38 +370,67 @@ def _sig_rsi_range(df, idx, params) -> str | None:
     return direction
 
 
-def _sig_atr_breakout(df, idx, params) -> str | None:
+def _sig_atr_breakout(df, idx, params):
     row, prev = df.iloc[idx], df.iloc[idx - 1]
-    # BUY: close above EMA9 with ATR expansion
     buy_cond = row['close'] > row['ema_9'] and row['atr_pct'] > params['min_atr_pct']
     sell_cond = row['close'] < row['ema_9'] and row['atr_pct'] > params['min_atr_pct']
-    if not (buy_cond or sell_cond):
-        return None
+    if not (buy_cond or sell_cond): return None
     direction = 'BUY' if buy_cond else 'SELL'
+    if direction == 'BUY' and not (row['ema_20'] > row['ema_50']): return None
+    if direction == 'SELL' and not (row['ema_20'] < row['ema_50']): return None
+    body = row['candle_body_pct'] if not np.isnan(row['candle_body_pct']) else 0
+    if body < params['candle_body_min']: return None
+    if not session_active(row['time']): return None
+    return direction
+
+
+def _sig_micro_scalp(df, idx, params):
+    """
+    ⚡ Micro Scalp: EMA3/7 ultra-fast cross within EMA20/50 trend.
+    Targets multiple trades per hour with tight 0.5×ATR SL and fixed TP.
+    RSI momentum confirms. Session filter OFF for max signals.
+    """
+    row, prev = df.iloc[idx], df.iloc[idx - 1]
+    # EMA3 crosses EMA7
+    cross_up = prev['ema_9'] <= prev['ema_21'] and row['ema_9'] > row['ema_21']
+    cross_down = prev['ema_9'] >= prev['ema_21'] and row['ema_9'] < row['ema_21']
+    # For micro scalp use ema_fast=3 (ema_9 holds value of ema_fast) and ema_slow=7
+    # We use ema_21 for the fast cross since we only have 4 EMA columns
+    # Actually we need to detect EMA3/7 cross — let's use close vs ema_fast directly
+    # Since ema_9 = EMA3 (mapped), ema_21 = EMA7 (mapped)
+    cross_up = prev['ema_9'] <= prev['ema_21'] and row['ema_9'] > row['ema_21']
+    cross_down = prev['ema_9'] >= prev['ema_21'] and row['ema_9'] < row['ema_21']
+    if not (cross_up or cross_down): return None
+    direction = 'BUY' if cross_up else 'SELL'
     # Trend: EMA20 > EMA50 for BUY
     if direction == 'BUY' and not (row['ema_20'] > row['ema_50']): return None
     if direction == 'SELL' and not (row['ema_20'] < row['ema_50']): return None
-    # Body filter (must be strong candle)
+    # RSI momentum
+    if direction == 'BUY' and not (row['rsi'] > 50): return None
+    if direction == 'SELL' and not (row['rsi'] < 50): return None
+    # ATR filter (minimal — tight SL so need some vol)
+    if row['atr_pct'] < params['min_atr_pct']: return None
+    # Body filter (minimal)
     body = row['candle_body_pct'] if not np.isnan(row['candle_body_pct']) else 0
     if body < params['candle_body_min']: return None
-    if not session_active(row['time']): return None
+    # NO session filter for Micro Scalp — trade all day
     return direction
 
 # ============================================================================
-# LIVE SCAN — single pair
+# LIVE SCAN
 # ============================================================================
 
 def scan_pair(symbol: str, interval: str, strategy: str, params: dict) -> dict | None:
     tf_int = TF_INTERVAL.get(interval, "1m")
     tf_rng = TF_PERIOD.get(interval, "5d")
     df = get_candles(symbol, tf_int, tf_rng, count=150)
-    if df.empty or len(df) < 60:
+    if df.empty or len(df) < 30:
         return None
     df = add_indicators(df, params)
     cooldown = st.session_state.pair_cooldown.get(symbol, 0)
     if cooldown > 0:
         return None
-    for ci in range(-8, -1):
+    for ci in range(-12, -1):
         direction = find_signal(df, ci, strategy, params)
         if direction is None:
             continue
@@ -417,7 +451,7 @@ def scan_pair(symbol: str, interval: str, strategy: str, params: dict) -> dict |
             'rsi': round(df.iloc[ci]['rsi'], 1),
             'atr': round(df.iloc[ci]['atr'], 5),
             'trend_dist': round(df.iloc[ci]['trend_dist'], 6),
-            'candle_pct': round(df.iloc[ci]['candle_body_pct'] * 100, 0) if not np.isnan(df.iloc[ci]['candle_body_pct']) else 0,
+            'candle_pct': round(df.iloc[ci]['candle_body_pct'] * 100, 0),
             'timeframe': interval, 'strategy': strategy,
         }
     return None
@@ -427,26 +461,62 @@ def scan_all_pairs(strategy, params) -> list:
     interval = st.session_state.get("active_tf", "M1")
     if not pairs:
         return []
+    ac = st.session_state.alert_config
     signals = []
     with ThreadPoolExecutor(max_workers=min(len(pairs), 8)) as ex:
         futures = {ex.submit(scan_pair, p, interval, strategy, params): p for p in pairs}
         for f in as_completed(futures):
             try:
                 s = f.result()
-                if s:
-                    # Apply alert threshold filters
-                    ac = st.session_state.alert_config
-                    if s['score'] < ac['min_score']:
-                        continue
-                    if s['rr'] < ac['min_rr']:
-                        continue
+                if s and s['score'] >= ac['min_score'] and s['rr'] >= ac['min_rr']:
                     signals.append(s)
             except Exception:
                 pass
     return signals
 
 # ============================================================================
-# BACKTEST — detailed, single pair
+# MT5 SIGNAL FILE GENERATOR
+# ============================================================================
+
+def generate_mt5_signal(sig: dict, params: dict) -> dict:
+    """
+    Generate MT5-compatible signal dict.
+    Creates a JSON signal that can be written to a file for MT5 EA to read.
+    Format compatible with common MT5 file-based signal systems.
+    """
+    pip_val = 0.0001 if 'JPY' not in sig['symbol'] else 0.01
+    sl_pips = abs(sig['entry'] - sig['sl']) / pip_val
+    tp_pips = abs(sig['tp'] - sig['entry']) / pip_val
+    return {
+        "action": "OPEN",
+        "symbol": sig['symbol'],
+        "type": "BUY" if sig['signal'] == 'BUY' else "SELL",
+        "entry": sig['entry'],
+        "stop_loss": sig['sl'],
+        "take_profit": sig['tp'],
+        "sl_pips": round(sl_pips, 1),
+        "tp_pips": round(tp_pips, 1),
+        "risk": "MEDIUM",
+        "score": sig['score'],
+        "strategy": sig['strategy'],
+        "timeframe": sig['timeframe'],
+        "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        "magic": 2024,
+    }
+
+
+def mt5_signal_file(symbol: str, signals: list) -> bytes:
+    """Generate JSON file with current signals for MT5 EA."""
+    data = {
+        "generated_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "symbol": symbol,
+        "total_signals": len(signals),
+        "signals": [generate_mt5_signal(s, {}) for s in signals],
+    }
+    return json.dumps(data, indent=2).encode('utf-8')
+
+# ============================================================================
+# BACKTEST
 # ============================================================================
 
 def run_backtest(symbol: str, candles: int, interval: str, strategy: str, params: dict) -> tuple:
@@ -490,7 +560,7 @@ def run_backtest(symbol: str, candles: int, interval: str, strategy: str, params
                 reward = abs(exit_p - pos_entry)
                 rr = round(reward / risk, 2) if risk > 0 else 0
                 pnl = (reward - risk) * 10000 if result == 'WIN' else -(risk * 10000)
-                # Compute hold time
+                pip_val = 0.0001 if 'JPY' not in symbol else 0.01
                 hold_candles = i - df[df['time'] == pos_time].index[0]
                 trades.append({
                     'signal': position, 'entry': pos_entry, 'exit': exit_p,
@@ -498,12 +568,13 @@ def run_backtest(symbol: str, candles: int, interval: str, strategy: str, params
                     'pnl_pips': round(pnl, 1), 'result': result,
                     'score': pos_score, 'entry_time': pos_time, 'exit_time': df.iloc[i]['time'],
                     'hold_candles': hold_candles,
+                    'sl_pips': round(abs(pos_entry - pos_sl) / pip_val, 1),
+                    'tp_pips': round(abs(pos_tp - pos_entry) / pip_val, 1),
                 })
                 position = None
     if not trades:
         return None, df, None
     td = pd.DataFrame(trades)
-    # Extended metrics
     total = len(td)
     wins = len(td[td['result'] == 'WIN'])
     losses = total - wins
@@ -517,25 +588,20 @@ def run_backtest(symbol: str, candles: int, interval: str, strategy: str, params
     running_max = cum.cummax()
     dd = cum - running_max
     max_dd = dd.min()
-    # Expectancy
-    expectancy = (td['pnl_pips'] / abs(td['rr'])).mean() if not td.empty else 0
-    # Streaks
+    expectancy = (td['pnl_pips'] / td['rr'].replace(0, np.nan)).mean() if not td.empty else 0
     td['win_streak'] = (td['result'] == 'WIN').astype(int) * (td.groupby((td['result'] != td['result'].shift()).cumsum()).cumcount() + 1) * (td['result'] == 'WIN').astype(int)
     td['loss_streak'] = (td['result'] == 'LOSS').astype(int) * (td.groupby((td['result'] != td['result'].shift()).cumsum()).cumcount() + 1) * (td['result'] == 'LOSS').astype(int)
     max_win_streak = int(td[td['result']=='WIN']['win_streak'].max()) if wins > 0 else 0
     max_loss_streak = int(td[td['result']=='LOSS']['loss_streak'].max()) if losses > 0 else 0
-    # Hourly distribution
     td['hour'] = pd.to_datetime(td['entry_time']).dt.hour
-    hourly = td.groupby('hour')['pnl_pips'].agg(['sum', 'count', 'mean']).reset_index()
-    hourly.columns = ['hour', 'pnl', 'count', 'avg_pnl']
-    # Monthly returns
+    hourly = td.groupby('hour')['pnl_pips'].agg(['sum', 'count']).reset_index()
+    hourly.columns = ['hour', 'pnl', 'count']
     td['month'] = pd.to_datetime(td['entry_time']).dt.to_period('M')
     monthly = td.groupby('month')['pnl_pips'].agg(['sum', 'count']).reset_index()
     monthly.columns = ['month', 'pnl', 'count']
-    # Trade direction breakdown
-    buy_trades = td[td['signal'] == 'BUY']
-    sell_trades = td[td['signal'] == 'SELL']
-    metrics = {
+    buy_td = td[td['signal'] == 'BUY']
+    sell_td = td[td['signal'] == 'SELL']
+    return td, df, {
         'total': total, 'wins': wins, 'losses': losses,
         'win_rate': round(wr, 1), 'total_pnl': round(total_pnl, 1),
         'avg_rr': round(avg_rr, 2), 'profit_factor': round(pf, 2) if pf != float('inf') else '∞',
@@ -545,18 +611,18 @@ def run_backtest(symbol: str, candles: int, interval: str, strategy: str, params
         'expectancy': round(expectancy, 2),
         'max_win_streak': max_win_streak, 'max_loss_streak': max_loss_streak,
         'avg_hold': round(td['hold_candles'].mean(), 1),
-        'buy_wr': round(len(buy_trades[buy_trades['result']=='WIN'])/len(buy_trades)*100, 1) if len(buy_trades) > 0 else 0,
-        'sell_wr': round(len(sell_trades[sell_trades['result']=='WIN'])/len(sell_trades)*100, 1) if len(sell_trades) > 0 else 0,
-        'buy_pnl': round(buy_trades['pnl_pips'].sum(), 1) if len(buy_trades) > 0 else 0,
-        'sell_pnl': round(sell_trades['pnl_pips'].sum(), 1) if len(sell_trades) > 0 else 0,
+        'buy_wr': round(len(buy_td[buy_td['result']=='WIN'])/len(buy_td)*100, 1) if len(buy_td) > 0 else 0,
+        'sell_wr': round(len(sell_td[sell_td['result']=='WIN'])/len(sell_td)*100, 1) if len(sell_td) > 0 else 0,
+        'buy_pnl': round(buy_td['pnl_pips'].sum(), 1),
+        'sell_pnl': round(sell_td['pnl_pips'].sum(), 1),
         'candles_used': len(df),
         'hourly': hourly.to_dict('records'),
         'monthly': monthly.to_dict('records'),
+        'trades_per_hour': round(total / (len(df) / 60), 2) if len(df) > 0 else 0,
     }
-    return td, df, metrics
 
 # ============================================================================
-# PLOT: CANDLESTICK + INDICATORS
+# PLOT: CANDLESTICK + INDICATORS (TradingView-like, pan only)
 # ============================================================================
 
 def plot_chart(df, trades_df=None, sig=None):
@@ -566,35 +632,37 @@ def plot_chart(df, trades_df=None, sig=None):
         rows=4, cols=1, shared_xaxes=True,
         row_heights=[0.40, 0.20, 0.20, 0.20],
         vertical_spacing=0.06,
-        subplot_titles=('Price + EMAs', 'Volume', 'RSI', 'ATR')
+        subplot_titles=('', '', '', ''),
     )
     fig.add_trace(go.Candlestick(
         x=df['time'], open=df['open'], high=df['high'],
         low=df['low'], close=df['close'],
         increasing_line_color='#26a69a', decreasing_line_color='#ef5350',
-        name='Price'
+        name='Price', hoverinfo='x+y'
     ), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df['time'], y=df['ema_9'], name='EMA9',
-        line=dict(color='#2196F3', width=1.5)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df['time'], y=df['ema_21'], name='EMA21',
-        line=dict(color='#FF9800', width=1.5)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df['time'], y=df['ema_9'], name='EMA Fast',
+        line=dict(color='#2196F3', width=1.5), hoverinfo='y'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df['time'], y=df['ema_21'], name='EMA Slow',
+        line=dict(color='#FF9800', width=1.5), hoverinfo='y'), row=1, col=1)
     fig.add_trace(go.Scatter(x=df['time'], y=df['ema_20'], name='EMA20',
-        line=dict(color='#00BCD4', width=1.2, dash='dash'), opacity=0.7), row=1, col=1)
+        line=dict(color='#00BCD4', width=1.2, dash='dash'), opacity=0.7, hoverinfo='y'), row=1, col=1)
     fig.add_trace(go.Scatter(x=df['time'], y=df['ema_50'], name='EMA50',
-        line=dict(color='#E91E63', width=1.2, dash='dash'), opacity=0.7), row=1, col=1)
+        line=dict(color='#E91E63', width=1.2, dash='dash'), opacity=0.7, hoverinfo='y'), row=1, col=1)
+
     if 'volume' in df.columns and df['volume'].sum() > 0:
         colors = ['#26a69a' if df['close'].iloc[i] >= df['open'].iloc[i] else '#ef5350' for i in range(len(df))]
         fig.add_trace(go.Bar(x=df['time'], y=df['volume'], name='Volume',
-            marker_color=colors, opacity=0.6), row=2, col=1)
+            marker_color=colors, opacity=0.6, hoverinfo='y'), row=2, col=1)
+
     if sig is not None and len(df) > 1:
         c = '#26a69a' if sig['signal'] == 'BUY' else '#ef5350'
         fig.add_trace(go.Scatter(
             x=[sig['time']], y=[sig['entry']],
             mode='markers+text',
-            marker=dict(size=24, color=c, symbol='arrow-up' if sig['signal'] == 'BUY' else 'arrow-down'),
+            marker=dict(size=22, color=c, symbol='arrow-up' if sig['signal'] == 'BUY' else 'arrow-down'),
             text=[f"▶ {sig['signal']} {sig['score']}"],
             textposition='top center', textfont=dict(color=c, size=11),
-            name=f"SIGNAL {sig['signal']}"
+            name=f"SIGNAL {sig['signal']}", hoverinfo='text'
         ), row=1, col=1)
         fig.add_hline(y=sig['sl'], line_dash='dash', line_color='#f44336', line_width=1.2,
             annotation_text=f"SL {sig['sl']}", annotation_position="bottom-right",
@@ -602,26 +670,37 @@ def plot_chart(df, trades_df=None, sig=None):
         fig.add_hline(y=sig['tp'], line_dash='dash', line_color='#4caf50', line_width=1.2,
             annotation_text=f"TP {sig['tp']}", annotation_position="top right",
             annotation_font_color='#4caf50', row=1, col=1)
+
     if trades_df is not None and not trades_df.empty:
         for _, t in trades_df.iterrows():
             c = '#26a69a' if t['signal'] == 'BUY' else '#ef5350'
             fig.add_trace(go.Scatter(x=[t['entry_time']], y=[t['entry']],
                 mode='markers', marker=dict(size=9, color=c, symbol='circle'),
-                showlegend=False), row=1, col=1)
+                showlegend=False, hoverinfo='y'), row=1, col=1)
             fig.add_trace(go.Scatter(x=[t['exit_time']], y=[t['exit']],
                 mode='markers', marker=dict(size=8, color='white', symbol='x'),
-                showlegend=False), row=1, col=1)
+                showlegend=False, hoverinfo='y'), row=1, col=1)
+
     fig.add_trace(go.Scatter(x=df['time'], y=df['rsi'], name='RSI',
-        line=dict(color='#9C27B0', width=1.5)), row=3, col=1)
+        line=dict(color='#9C27B0', width=1.5), hoverinfo='y'), row=3, col=1)
     fig.add_hline(y=50, line_dash='dot', line_color='gray', row=3, col=1)
     fig.add_hline(y=70, line_dash='dash', line_color='red', line_width=0.5, row=3, col=1)
     fig.add_hline(y=30, line_dash='dash', line_color='green', line_width=0.5, row=3, col=1)
+
     fig.add_trace(go.Scatter(x=df['time'], y=df['atr'], name='ATR',
         fill='tozeroy', line=dict(color='#FF5722', width=1),
-        fillcolor='rgba(255,87,34,0.12)'), row=4, col=1)
-    fig.update_layout(template='plotly_dark', height=750, showlegend=True,
+        fillcolor='rgba(255,87,34,0.12)', hoverinfo='y'), row=4, col=1)
+
+    fig.update_layout(
+        template='plotly_dark', height=720, showlegend=True,
         legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
-        xaxis_rangeslider_visible=False)
+        xaxis_rangeslider_visible=False,
+        scrollZoom=False,
+        dragmode='pan',
+        hovermode='x unified',
+        margin=dict(l=50, r=20, t=30, b=40),
+        chart_border_width=1, chart_border_color='#333',
+    )
     return fig
 
 # ============================================================================
@@ -638,17 +717,20 @@ def equity_chart(td):
         x=list(range(1, len(cum)+1)), y=cum.values,
         mode='lines+markers', line=dict(color='#26a69a', width=2),
         marker=dict(color=colors, size=4),
-        name='Cumulative P&L (pips)',
-        fill='tozeroy', fillcolor='rgba(38,166,154,0.1)',
+        name='Equity (pips)', fill='tozeroy', fillcolor='rgba(38,166,154,0.1)',
+        hoverinfo='x+y'
     ))
-    fig.update_layout(template='plotly_dark', height=220,
+    fig.update_layout(
+        template='plotly_dark', height=220,
         xaxis_title="Trade #", yaxis_title="P&L (pips)",
-        hovermode='x unified', margin=dict(l=0, r=0, t=10, b=0))
+        hovermode='x unified', margin=dict(l=50, r=20, t=10, b=40),
+        scrollZoom=False, dragmode='pan',
+    )
     fig.add_hline(y=0, line_dash='dot', line_color='gray', line_width=0.5)
     return fig
 
 # ============================================================================
-# PLOT: DRAWDOWN CHART
+# PLOT: DRAWDOWN
 # ============================================================================
 
 def drawdown_chart(td):
@@ -663,11 +745,14 @@ def drawdown_chart(td):
         mode='lines+markers', line=dict(color='#ef5350', width=2),
         marker=dict(color='#ef5350', size=3),
         fill='tozeroy', fillcolor='rgba(239,83,80,0.15)',
-        name='Drawdown (pips)',
+        name='Drawdown (pips)', hoverinfo='x+y'
     ))
-    fig.update_layout(template='plotly_dark', height=180,
+    fig.update_layout(
+        template='plotly_dark', height=170,
         xaxis_title="Trade #", yaxis_title="Drawdown (pips)",
-        hovermode='x unified', margin=dict(l=0, r=0, t=10, b=0))
+        hovermode='x unified', margin=dict(l=50, r=20, t=10, b=40),
+        scrollZoom=False, dragmode='pan',
+    )
     fig.add_hline(y=0, line_dash='dot', line_color='gray', line_width=0.5)
     return fig
 
@@ -681,21 +766,18 @@ def pnl_dist_chart(td):
     fig = go.Figure()
     win_pnls = td[td['result']=='WIN']['pnl_pips']
     loss_pnls = td[td['result']=='LOSS']['pnl_pips']
-    fig.add_trace(go.Histogram(
-        x=win_pnls, name='Wins', marker_color='#26a69a',
-        opacity=0.7, nbinsx=20,
-    ))
-    fig.add_trace(go.Histogram(
-        x=loss_pnls, name='Losses', marker_color='#ef5350',
-        opacity=0.7, nbinsx=20,
-    ))
-    fig.update_layout(template='plotly_dark', height=200,
-        xaxis_title="P&L (pips)", yaxis_title="Frequency",
-        barmode='overlay', margin=dict(l=0, r=0, t=10, b=0))
+    fig.add_trace(go.Histogram(x=win_pnls, name='Wins', marker_color='#26a69a', opacity=0.75, nbinsx=25))
+    fig.add_trace(go.Histogram(x=loss_pnls, name='Losses', marker_color='#ef5350', opacity=0.75, nbinsx=25))
+    fig.update_layout(
+        template='plotly_dark', height=200,
+        xaxis_title="P&L (pips)", yaxis_title="Count",
+        barmode='overlay', margin=dict(l=50, r=20, t=10, b=40),
+        hovermode='x unified', scrollZoom=False, dragmode='pan',
+    )
     return fig
 
 # ============================================================================
-# PLOT: HOURLY RETURNS HEATMAP
+# PLOT: HOURLY RETURNS
 # ============================================================================
 
 def hourly_chart(metrics):
@@ -708,11 +790,38 @@ def hourly_chart(metrics):
         x=hr['hour'], y=hr['pnl'],
         marker_color=hr['pnl'],
         marker=dict(coloraxis='coloraxis'),
-        name='P&L by Hour',
+        name='P&L by Hour', hoverinfo='x+y'
     ))
-    fig.update_layout(template='plotly_dark', height=200,
+    fig.update_layout(
+        template='plotly_dark', height=200,
         xaxis_title="Hour (UTC)", yaxis_title="Net P&L (pips)",
-        coloraxis=dict(colorscale='RdYlGn'), margin=dict(l=0, r=0, t=10, b=0))
+        coloraxis=dict(colorscale='RdYlGn'), margin=dict(l=50, r=20, t=10, b=40),
+        hovermode='x unified', scrollZoom=False, dragmode='pan',
+    )
+    return fig
+
+# ============================================================================
+# PLOT: MONTHLY RETURNS HEATMAP
+# ============================================================================
+
+def monthly_heatmap(metrics):
+    records = metrics.get('monthly', [])
+    if not records:
+        return None
+    mr = pd.DataFrame(records)
+    fig = go.Figure(data=go.Heatmap(
+        x=mr['month'].astype(str), y=['P&L'],
+        z=mr['pnl'], text=mr[['pnl', 'count']].apply(lambda r: f"{r['pnl']:.0f}p / {r['count']}t", axis=1),
+        texttemplate="%{text}", textfont={"color": "white"},
+        colorscale='RdYlGn', zmid=0,
+        hoverinfo='x+y+text',
+    ))
+    fig.update_layout(
+        template='plotly_dark', height=120,
+        xaxis_title="Month", yaxis_title="",
+        margin=dict(l=50, r=20, t=10, b=40),
+        scrollZoom=False, dragmode='pan',
+    )
     return fig
 
 # ============================================================================
@@ -728,49 +837,79 @@ def tv_widget_html(symbol: str, interval: str = "M1") -> str:
         f"hide_sidebar=false&hide_top_toolbar=false&save_image=false&"
         f"studies=RSI@tv-basicthemes%3B!EMA@tv-basicthemes%3B!&"
         f"theme=dark&style=1&locale=en&toolbar_bg=%23363636&"
-        f"enable_publishing=false&allow_symbol_change=true"
+        f"enable_publishing=false&allow_symbol_change=true&"
+        f"support_host=https://www.tradingview.com"
     )
-    return f'<iframe src="{url}" width="100%" height="520" frameborder="0" allowtransparency="true" scrolling="yes" style="border-radius:10px;border:1px solid #333;" title="TV {symbol}"></iframe>'
+    return f'<iframe src="{url}" width="100%" height="500" frameborder="0" allowtransparency="true" scrolling="no" style="border-radius:10px;border:1px solid #2a2a2a;" title="TV {symbol}"></iframe>'
 
 # ============================================================================
 # SIGNAL CARD
 # ============================================================================
 
-def signal_card(sig) -> str:
+def signal_card(sig, show_mt5=False) -> str:
     is_buy = sig['signal'] == 'BUY'
     border = '#4caf50' if is_buy else '#f44336'
-    bg = '#1b5e20' if is_buy else '#7f0000'
+    bg = '#0d2e12' if is_buy else '#2e0d0d'
     arrow = '🟢 BUY' if is_buy else '🔴 SELL'
+    pip_val = 0.0001 if 'JPY' not in sig['symbol'] else 0.01
+    sl_pips = round(abs(sig['entry'] - sig['sl']) / pip_val, 1)
+    tp_pips = round(abs(sig['tp'] - sig['entry']) / pip_val, 1)
     return f"""
-    <div style="padding:16px;border-radius:12px;border:3px solid {border};background:{bg};color:white;margin:6px 0;">
+    <div style="padding:16px;border-radius:12px;border:2px solid {border};background:{bg};color:white;margin:6px 0;">
         <div style="display:flex;justify-content:space-between;align-items:center;">
-            <h3 style="margin:0;">{arrow} — {sig['symbol']} <span style="font-size:12px;opacity:0.7;">[{sig['timeframe']}]</span></h3>
+            <h3 style="margin:0;">{arrow} — {sig['symbol']} <span style="font-size:12px;opacity:0.7;">[{sig['timeframe']}]</span> <span style="font-size:11px;color:#aaa;">{sig.get('strategy','')}</span></h3>
             <div style="background:{border};border-radius:50%;width:60px;height:60px;display:flex;flex-direction:column;align-items:center;justify-content:center;">
                 <span style="font-size:18px;font-weight:bold;">{sig['score']}</span>
                 <span style="font-size:7px;">SCORE</span>
             </div>
         </div>
-        <hr style="opacity:0.25;margin:8px 0;">
-        <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:10px;">
+        <hr style="opacity:0.2;margin:8px 0;border-color:#333;">
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr 1fr;gap:8px;">
             <div><small>ENTRY</small><br><b>{sig['entry']}</b></div>
-            <div><small>SL</small><br><b>{sig['sl']}</b></div>
-            <div><small>TP</small><br><b>{sig['tp']}</b></div>
+            <div><small>SL</small><br><b style='color:#f44336;'>{sig['sl']}</b> <small style='color:#888;'>{sl_pips}p</small></div>
+            <div><small>TP</small><br><b style='color:#4caf50;'>{sig['tp']}</b> <small style='color:#888;'>{tp_pips}p</small></div>
             <div><small>R:R</small><br><b>1:{sig['rr']}</b></div>
-        </div>
-        <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:10px;margin-top:6px;">
             <div><small>RSI</small><br><b>{sig['rsi']}</b></div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px;margin-top:6px;">
             <div><small>ATR</small><br><b>{sig['atr']}</b></div>
             <div><small>Body</small><br><b>{sig['candle_pct']:.0f}%</b></div>
+            <div><small>TrendDist</small><br><b>{sig['trend_dist']:.6f}</b></div>
             <div><small>UTC</small><br><b>{sig['time']}</b></div>
         </div>
     </div>"""
+
+# ============================================================================
+# SOUND ALERT (browser beep via JS)
+# ============================================================================
+
+SOUND_JS = """
+<script>
+function playBeep() {
+    try {
+        var ctx = new (window.AudioContext || window.webkitAudioContext)();
+        var osc = ctx.createOscillator();
+        var gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.frequency.value = 880;
+        osc.type = 'sine';
+        gain.gain.setValueAtTime(0.3, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.4);
+        osc.start(ctx.currentTime);
+        osc.stop(ctx.currentTime + 0.4);
+    } catch(e) {}
+}
+playBeep();
+</script>
+"""
 
 # ============================================================================
 # STREAMLIT APP
 # ============================================================================
 
 st.set_page_config(page_title="MT5 Scalper Pro", page_icon="📈", layout="wide")
-st.title("📈 MT5 Scalper Pro — Real-Time Trading Assistant")
+st.title("📈 MT5 Scalper Pro")
 init_session()
 
 # ─────────────────────────────────────────────────
@@ -779,71 +918,66 @@ init_session()
 with st.sidebar:
     st.header("⚙️ Settings")
 
-    # Strategy selector
     strat_options = list(STRATEGIES.keys())
     active_strat = st.selectbox(
-        "🎯 Strategy",
-        strat_options,
-        index=strat_options.index(st.session_state.get("active_strategy", DEFAULT_STRATEGY)),
-        help="Select the trading strategy"
+        "🎯 Strategy", strat_options,
+        index=strat_options.index(st.session_state.get("active_strategy", DEFAULT_STRATEGY))
     )
     st.session_state["active_strategy"] = active_strat
-    params = STRATEGIES[active_strat]["params"].copy()
+    st.caption(f"_{STRATEGIES[active_strat]['description']}_")
 
-    st.markdown(f"<small style='color:#888'>{STRATEGIES[active_strat]['description']}</small>", unsafe_allow_html=True)
+    sym_sidebar = st.text_input("📌 Pinned Symbol", value=st.session_state.get("pinned_symbol", "EURUSD")).upper().strip()
+    st.session_state["pinned_symbol"] = sym_sidebar
 
-    # Symbol
-    sym = st.text_input("📌 Symbol", value="EURUSD").upper().strip()
-
-    # Timeframe
-    tf_options = ["M1", "M5", "H1"]
-    tf = st.selectbox("⏱️ Timeframe", tf_options, index=0)
+    tf = st.selectbox("⏱️ Timeframe", ["M1", "M5", "H1"], index=0)
     st.session_state["active_tf"] = tf
 
     st.markdown("---")
-    st.subheader(f"📐 {active_strat} Parameters")
+    st.subheader(f"📐 {active_strat}")
+    p = STRATEGIES[active_strat]["params"].copy()
 
-    # Dynamic params based on strategy
-    params["ema_fast"] = st.slider("EMA Pullback (Fast)", 3, 21, params["ema_fast"])
-    params["ema_slow"] = st.slider("EMA Signal (Slow)", 5, 55, params["ema_slow"])
-    params["ema_trend_fast"] = st.slider("EMA Trend Fast", 5, 30, params["ema_trend_fast"])
-    params["ema_trend_slow"] = st.slider("EMA Trend Slow", 20, 100, params["ema_trend_slow"])
-    params["rsi_period"] = st.slider("RSI Period", 5, 21, params["rsi_period"])
-    params["atr_period"] = st.slider("ATR Period", 5, 21, params["atr_period"])
+    p["ema_fast"] = st.slider("EMA Fast (pullback)", 3, 21, p["ema_fast"])
+    p["ema_slow"] = st.slider("EMA Slow (signal)", 5, 55, p["ema_slow"])
+    p["ema_trend_fast"] = st.slider("EMA Trend Fast", 5, 30, p["ema_trend_fast"])
+    p["ema_trend_slow"] = st.slider("EMA Trend Slow", 20, 100, p["ema_trend_slow"])
+    p["rsi_period"] = st.slider("RSI Period", 3, 21, p["rsi_period"])
+    p["atr_period"] = st.slider("ATR Period", 3, 21, p["atr_period"])
 
     st.subheader("🎯 Filters")
-    params["min_trend_dist_pct"] = st.slider("Min Trend Dist (×10000)", 1, 20, int(params["min_trend_dist_pct"] * 10000)) / 10000
-    params["min_atr_pct"] = st.slider("Min ATR % (×10000)", 1, 15, int(params["min_atr_pct"] * 10000)) / 10000
-    params["candle_body_min"] = st.slider("Candle Body Min %", 20, 80, int(params["candle_body_min"] * 100)) / 100
+    p["min_trend_dist_pct"] = st.slider("Trend Dist (×10000)", 1, 30, int(p["min_trend_dist_pct"] * 10000)) / 10000
+    p["min_atr_pct"] = st.slider("Min ATR % (×10000)", 1, 20, int(p["min_atr_pct"] * 10000)) / 10000
+    p["candle_body_min"] = st.slider("Body Min %", 20, 80, int(p["candle_body_min"] * 100)) / 100
 
     st.subheader("🛡️ Risk")
-    params["sl_atr_mult"] = st.slider("SL ATR Multiplier", 0.5, 4.0, params["sl_atr_mult"], 0.1)
-    params["sl_min_atr"] = st.slider("Min SL ATR Factor", 0.3, 3.0, params["sl_min_atr"], 0.1)
+    p["sl_atr_mult"] = st.slider("SL ATR ×", 0.3, 4.0, p["sl_atr_mult"], 0.1)
+    p["sl_min_atr"] = st.slider("Min SL ATR ×", 0.1, 2.0, p["sl_min_atr"], 0.1)
 
     st.subheader("⏱️ Cooldown & Score")
-    params["cooldown"] = st.slider("Cooldown Candles", 1, 15, params["cooldown"])
-    params["min_score"] = st.slider("Min Signal Score", 30, 95, params["min_score"])
+    p["cooldown"] = st.slider("Cooldown (candles)", 0, 15, p["cooldown"])
+    p["min_score"] = st.slider("Min Score", 20, 95, p["min_score"])
 
-    # RSI Range specific
     if active_strat == "RSI Range":
         st.subheader("📊 RSI Thresholds")
-        params["rsi_buy_max"] = st.slider("RSI BUY threshold (cross above)", 20, 50, params.get("rsi_buy_max", 35))
-        params["rsi_sell_min"] = st.slider("RSI SELL threshold (cross below)", 50, 80, params.get("rsi_sell_min", 65))
+        p["rsi_buy_max"] = st.slider("RSI BUY (oversold)", 20, 50, p.get("rsi_buy_max", 35))
+        p["rsi_sell_min"] = st.slider("RSI SELL (overbought)", 50, 80, p.get("rsi_sell_min", 65))
+
+    if active_strat == "Micro Scalp":
+        st.subheader("⚡ Micro Scalp")
+        p["use_tp_fixed"] = True
+        p["tp_pips"] = st.slider("Fixed TP (pips)", 3, 20, int(p.get("tp_pips", 8)), 1)
+
+    st.session_state["active_params"] = p
 
     st.markdown("---")
-    st.subheader("📈 Backtest Settings")
-    bt_candles = st.slider("Candles", 300, 3000, 1500, 100, key="bt_candles")
-
     st.subheader("🔍 Scanner Pairs")
     selected = st.multiselect("Pairs", ALL_PAIRS, default=st.session_state.selected_pairs)
     st.session_state.selected_pairs = selected
 
-    st.markdown("---")
     st.markdown("**🕐 Sessions:** London 08-12 UTC | NY 13-17 UTC")
 
     if st.session_state.signal_history:
         st.subheader("📜 Recent Signals")
-        for h in reversed(st.session_state.signal_history[-10:]):
+        for h in reversed(st.session_state.signal_history[-8:]):
             c = '#4caf50' if h['signal'] == 'BUY' else '#f44336'
             st.markdown(
                 f"<span style='color:{c};'>● {h['signal']}</span> {h['symbol']} "
@@ -863,20 +997,32 @@ with tab1:
     now = datetime.now()
     st.markdown(session_boxes(now), unsafe_allow_html=True)
 
-    col_sym, col_tf, col_strat = st.columns([2, 1, 2])
+    pinned = st.session_state.get("pinned_symbol", "EURUSD")
+    active = st.session_state.get("active_strategy", DEFAULT_STRATEGY)
+    params = st.session_state.get("active_params", STRATEGIES[active]["params"].copy())
+
+    # Top bar: symbol TF strategy selectors
+    col_sym, col_tf, col_strat, col_pin = st.columns([2, 1, 2, 1])
     with col_sym:
         dash_sym = st.selectbox("Symbol", ALL_PAIRS,
-            index=ALL_PAIRS.index(sym) if sym in ALL_PAIRS else 0, key="dash_sym")
+            index=ALL_PAIRS.index(pinned) if pinned in ALL_PAIRS else 0, key="dash_sym")
     with col_tf:
-        dash_tf = st.selectbox("TF", ["M1", "M5", "H1"],
-            index=["M1", "M5", "H1"].index(tf), key="dash_tf")
+        dash_tf = st.selectbox("TF", ["M1", "M5", "H1"], index=["M1", "M5", "H1"].index(tf), key="dash_tf")
     with col_strat:
         dash_strat = st.selectbox("Strategy", list(STRATEGIES.keys()),
-            index=list(STRATEGIES.keys()).index(active_strat), key="dash_strat")
+            index=list(STRATEGIES.keys()).index(active), key="dash_strat_v2")
+    with col_pin:
+        st.markdown("")
+        if st.button("📌 Pin Symbol", use_container_width=True):
+            st.session_state["pinned_symbol"] = dash_sym
+            st.session_state["active_strategy"] = dash_strat
+            st.rerun()
+
+    # Override params with selected strategy
     dash_params = STRATEGIES[dash_strat]["params"].copy()
-    # Override with sidebar sliders
     dash_params.update({k: v for k, v in params.items() if k in dash_params})
 
+    # TradingView chart
     st.markdown("### 📊 Live TradingView Chart")
     st.markdown(tv_widget_html(dash_sym, dash_tf), unsafe_allow_html=True)
 
@@ -886,22 +1032,21 @@ with tab1:
     df_dash = get_candles(dash_sym, tf_int, tf_rng, count=200)
 
     if df_dash.empty:
-        st.warning(f"❌ No data for {dash_sym} [{dash_tf}]. Market may be closed or Yahoo rate-limiting.")
+        st.warning(f"❌ No data for {dash_sym} [{dash_tf}]. Market closed or Yahoo rate-limiting.")
     else:
         df_dash = add_indicators(df_dash, dash_params)
         last = df_dash.iloc[-1]
         age = (datetime.now() - last['time']).total_seconds() / 60
-        age_str = f"{int(age)} min ago" if age > 0 else "just now"
         fc = "🟢" if age < 15 else "🟡" if age < 60 else "🔴"
         trend_dir = "🟢 UP" if last['ema_20'] > last['ema_50'] else "🔴 DOWN"
         rsi_str, rsi_col = rsi_display(float(last['rsi']))
 
-        st.caption(f"{fc} {len(df_dash)} candles | Last: {last['time'].strftime('%Y-%m-%d %H:%M')} UTC ({age_str}) | Yahoo Finance v8")
+        st.caption(f"{fc} {len(df_dash)} candles | {last['time'].strftime('%Y-%m-%d %H:%M')} UTC | Yahoo v8 | 📌 {dash_strat} on {dash_sym}")
 
         c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
         c1.metric("Price", f"{last['close']:.5f}")
-        c2.metric("EMA9", f"{last['ema_9']:.5f}")
-        c3.metric("EMA21", f"{last['ema_21']:.5f}")
+        c2.metric(f"EMA{dash_params['ema_fast']}", f"{last['ema_9']:.5f}")
+        c3.metric(f"EMA{dash_params['ema_slow']}", f"{last['ema_21']:.5f}")
         c4.metric("EMA20", f"{last['ema_20']:.5f}")
         c5.metric("EMA50", f"{last['ema_50']:.5f}")
         c6.markdown(f"<div style='text-align:center;padding:4px 0;'><small>RSI</small><br><b style='color:{rsi_col};'>{rsi_str}</b></div>", unsafe_allow_html=True)
@@ -911,207 +1056,249 @@ with tab1:
         st.markdown("---")
         fig = plot_chart(df_dash)
         if fig:
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': False, 'displayModeBar': True, 'modeBarButtonsToRemove': ['lasso2d', 'select2d', 'autoScale2d', 'hoverCompareCartesian', 'toggleSpikelines']})
 
         sig = scan_pair(dash_sym, dash_tf, dash_strat, dash_params)
         if sig:
             st.markdown(signal_card(sig), unsafe_allow_html=True)
-            st.toast(f"📢 {sig['signal']} on {sig['symbol']} @ {sig['entry']} (score:{sig['score']})", icon="📈")
+            st.toast(f"📢 {sig['signal']} {sig['symbol']} @ {sig['entry']} (score:{sig['score']})", icon="📈")
+            st.session_state["mt5_signal"] = generate_mt5_signal(sig, dash_params)
+            # Browser beep for new signal
+            st.markdown(SOUND_JS, unsafe_allow_html=True)
         else:
-            st.info(
-                f"⚪ No signal ({dash_strat}) | score≥{dash_params['min_score']}, "
-                f"ATR%≥{dash_params['min_atr_pct']:.5f}, body≥{dash_params['candle_body_min']*100:.0f}%, "
-                f"session=London/NY | RSI={last['rsi']:.1f} | Trend={trend_dir}"
-            )
+            st.info(f"⚪ No signal ({dash_strat}) | score≥{dash_params['min_score']} | ATR%≥{dash_params['min_atr_pct']:.5f} | body≥{dash_params['candle_body_min']*100:.0f}% | RSI={last['rsi']:.1f} | {trend_dir}")
 
 # ═══════════════════════════════════════════════════
-# TAB 2: BACKTEST — single pair, detailed
+# TAB 2: BACKTEST
 # ═══════════════════════════════════════════════════
 with tab2:
-    st.header("📈 Backtest — Single Pair Detailed Analysis")
-    st.caption(f"Strategy: {active_strat} | SL: ATR×{params['sl_atr_mult']} | TP: dynamic 1.2–1.5× | Session: London+NY | Cooldown: {params['cooldown']} candles")
+    st.header("📈 Backtest")
+    st.caption(f"Strategy parameters from sidebar apply | SL: ATR×{params.get('sl_atr_mult','?')} | TP: dynamic | Session: London+NY | Cooldown: {params.get('cooldown',0)}")
 
-    # Controls row
     bk_col1, bk_col2, bk_col3, bk_col4 = st.columns([2, 1, 1, 1])
     with bk_col1:
-        bt_sym = st.selectbox("Symbol", ALL_PAIRS,
-            index=ALL_PAIRS.index(sym) if sym in ALL_PAIRS else 0, key="bt_sym_select")
+        bt_sym = st.selectbox("Symbol", ALL_PAIRS, index=0, key="bt_sym")
     with bk_col2:
-        bt_tf = st.selectbox("TF", ["M1", "M5", "H1"],
-            index=["M1", "M5", "H1"].index(tf), key="bt_tf_select")
+        bt_tf = st.selectbox("TF", ["M1", "M5", "H1"], index=["M1", "M5", "H1"].index(tf), key="bt_tf")
     with bk_col3:
         bt_strat = st.selectbox("Strategy", list(STRATEGIES.keys()),
-            index=list(STRATEGIES.keys()).index(active_strat), key="bt_strat_select")
+            index=list(STRATEGIES.keys()).index(active), key="bt_strat")
     with bk_col4:
-        bt_candles_val = st.selectbox("Candles", [300, 500, 1000, 1500, 2000, 3000],
-            index=3, key="bt_candles_select")
+        bt_candles = st.selectbox("Candles", [300, 500, 1000, 1500, 2000, 3000], index=3, key="bt_candles")
 
     bt_params = STRATEGIES[bt_strat]["params"].copy()
-    # Use same slider values from sidebar for quick backtest
     bt_params.update({k: v for k, v in params.items() if k in bt_params})
 
-    run_key = "bt_run_v2"
-    if st.button("▶️ Run Backtest", use_container_width=True, type="primary", key=run_key):
-        with st.spinner(f"Running {bt_strat} backtest on {bt_sym} ({bt_tf}, {bt_candles_val} candles)..."):
-            td, df_bt, metrics = run_backtest(bt_sym, bt_candles_val, bt_tf, bt_strat, bt_params)
-            st.session_state.bt_result = (td, df_bt, metrics, bt_sym, bt_tf, bt_strat)
+    if st.button("▶️ Run Backtest", use_container_width=True, type="primary", key="run_bt_v3"):
+        with st.spinner(f"{bt_strat} on {bt_sym} [{bt_tf}] — {bt_candles} candles..."):
+            td, df_bt, m = run_backtest(bt_sym, bt_candles, bt_tf, bt_strat, bt_params)
+            st.session_state.bt_result = (td, df_bt, m, bt_sym, bt_tf, bt_strat, bt_params)
 
-    # ── Show results ──
     bt_res = st.session_state.get("bt_result")
     if bt_res:
-        td, df_bt, m, bt_sym_saved, bt_tf_saved, bt_strat_saved = bt_res
+        td, df_bt, m, sym_b, tf_b, strat_b, par_b = bt_res
         if m is None:
-            st.error(f"❌ No trades generated for {bt_sym_saved} [{bt_tf_saved}] using {bt_strat_saved}. Try: lowering min_score, lowering min_ATR%, increasing candles, or switching timeframe to H1.")
+            st.error(f"❌ No trades for {sym_b} [{tf_b}] using {strat_b}. Try: lower min_score, lower min_ATR%, more candles, or H1 TF.")
         else:
-            st.success(f"✅ {bt_strat_saved} on {bt_sym_saved} [{bt_tf_saved}] — {m['total']} trades | {m['win_rate']}% WR | {m['total_pnl']} pips net | PF {m['profit_factor']}")
-
-            # ── Summary Metrics ──
+            # Summary row 1
             sm1, sm2, sm3, sm4, sm5 = st.columns(5)
             sm1.metric("Total Trades", m['total'])
             sm2.metric("Win Rate", f"{m['win_rate']}%")
             sm3.metric("Profit Factor", m['profit_factor'])
-            sm4.metric("Max Drawdown", f"{m['max_drawdown']} pips")
-            sm5.metric("Net P&L", f"{m['total_pnl']} pips {'🟢' if m['total_pnl'] > 0 else '🔴'}")
+            sm4.metric("Max DD", f"{m['max_drawdown']} pips")
+            pnl_color = "🟢" if m['total_pnl'] > 0 else "🔴"
+            sm5.metric("Net P&L", f"{m['total_pnl']} pips {pnl_color}")
 
-            sm6, sm7, sm8, sm9, sm10 = st.columns(5)
-            sm6.metric("W / L", f"{m['wins']} / {m['losses']}")
-            sm7.metric("Avg R:R", f"1:{m['avg_rr']}")
-            sm8.metric("Expectancy", f"{m['expectancy']} pips/trade")
-            sm9.metric("Avg Hold", f"{m['avg_hold']} candles")
-            sm10.metric("Best / Worst", f"{m['best']} / {m['worst']} pips")
+            # Summary row 2
+            sr1, sr2, sr3, sr4, sr5 = st.columns(5)
+            sr1.metric("W / L", f"{m['wins']} / {m['losses']}")
+            sr2.metric("Avg R:R", f"1:{m['avg_rr']}")
+            sr3.metric("Expectancy", f"{m['expectancy']} pips/t")
+            sr4.metric("Trades/Hour", m['trades_per_hour'])
+            sr5.metric("Avg Hold", f"{m['avg_hold']} cndls")
 
-            sm11, sm12, sm13, sm14 = st.columns(4)
-            sm11.metric("Max Win Streak", f"{m['max_win_streak']} 🟢")
-            sm12.metric("Max Loss Streak", f"{m['max_loss_streak']} 🔴")
-            sm13.metric("Buy WR", f"{m['buy_wr']}% (PnL: {m['buy_pnl']})")
-            sm14.metric("Sell WR", f"{m['sell_wr']}% (PnL: {m['sell_pnl']})")
+            # Summary row 3: streaks + direction
+            ss1, ss2, ss3, ss4 = st.columns(4)
+            ss1.metric("Win Streak 🟢", f"×{m['max_win_streak']}")
+            ss2.metric("Loss Streak 🔴", f"×{m['max_loss_streak']}")
+            ss3.metric("BUY WR", f"{m['buy_wr']}% ({m['buy_pnl']}p)")
+            ss4.metric("SELL WR", f"{m['sell_wr']}% ({m['sell_pnl']}p)")
 
-            # ── Charts row ──
-            st.markdown("### 📉 Analysis Charts")
-            chart_col1, chart_col2 = st.columns(2)
-            with chart_col1:
+            st.markdown("---")
+            st.markdown("### 📉 Equity & Drawdown")
+            eq_col, dd_col = st.columns(2)
+            with eq_col:
                 eq = equity_chart(td)
                 if eq:
-                    st.plotly_chart(eq, use_container_width=True)
-            with chart_col2:
+                    st.plotly_chart(eq, use_container_width=True, config={'scrollZoom': False, 'displayModeBar': True, 'modeBarButtonsToRemove': ['lasso2d', 'select2d', 'autoScale2d', 'hoverCompareCartesian']})
+            with dd_col:
                 dd = drawdown_chart(td)
                 if dd:
-                    st.plotly_chart(dd, use_container_width=True)
+                    st.plotly_chart(dd, use_container_width=True, config={'scrollZoom': False, 'displayModeBar': True, 'modeBarButtonsToRemove': ['lasso2d', 'select2d', 'autoScale2d', 'hoverCompareCartesian']})
 
-            dist_col1, dist_col2 = st.columns(2)
-            with dist_col1:
+            st.markdown("### 📊 P&L Distribution & Hourly Returns")
+            dist_col, hr_col = st.columns(2)
+            with dist_col:
                 dist = pnl_dist_chart(td)
                 if dist:
-                    st.plotly_chart(dist, use_container_width=True)
-            with dist_col2:
-                hr_chart = hourly_chart(m)
-                if hr_chart:
-                    st.plotly_chart(hr_chart, use_container_width=True)
+                    st.plotly_chart(dist, use_container_width=True, config={'scrollZoom': False, 'displayModeBar': True, 'modeBarButtonsToRemove': ['lasso2d', 'select2d', 'autoScale2d', 'hoverCompareCartesian']})
+            with hr_col:
+                hc = hourly_chart(m)
+                if hc:
+                    st.plotly_chart(hc, use_container_width=True, config={'scrollZoom': False, 'displayModeBar': True, 'modeBarButtonsToRemove': ['lasso2d', 'select2d', 'autoScale2d', 'hoverCompareCartesian']})
 
-            # ── Price chart with trades ──
+            st.markdown("### 📅 Monthly Returns")
+            mh = monthly_heatmap(m)
+            if mh:
+                st.plotly_chart(mh, use_container_width=True, config={'scrollZoom': False, 'displayModeBar': True, 'modeBarButtonsToRemove': ['lasso2d', 'select2d', 'autoScale2d', 'hoverCompareCartesian']})
+
             st.markdown("### 📊 Price Chart with Trade Markers")
             if df_bt is not None and not df_bt.empty:
                 fig_bt = plot_chart(df_bt, td)
                 if fig_bt:
-                    st.plotly_chart(fig_bt, use_container_width=True)
+                    st.plotly_chart(fig_bt, use_container_width=True, config={'scrollZoom': False, 'displayModeBar': True, 'modeBarButtonsToRemove': ['lasso2d', 'select2d', 'autoScale2d', 'hoverCompareCartesian']})
 
-            # ── Trade Log ──
             st.markdown(f"### 📋 Trade Log ({m['total']} trades)")
-            disp = td[['entry_time', 'signal', 'entry', 'sl', 'tp', 'rr', 'score', 'result', 'pnl_pips', 'hold_candles']].tail(50).copy()
-            disp.columns = ['Time (UTC)', 'Signal', 'Entry', 'SL', 'TP', 'R:R', 'Score', 'Result', 'P&L', 'Hold(c)']
-            disp['Time (UTC)'] = disp['Time (UTC)'].dt.strftime('%Y-%m-%d %H:%M')
+            disp = td[['entry_time', 'signal', 'entry', 'sl', 'tp', 'rr', 'score', 'result', 'pnl_pips', 'hold_candles', 'sl_pips', 'tp_pips']].tail(50).copy()
+            disp.columns = ['Time', 'Dir', 'Entry', 'SL', 'TP', 'R:R', 'Score', 'Result', 'P&L', 'Hold', 'SL(p)', 'TP(p)']
+            disp['Time'] = disp['Time'].dt.strftime('%Y-%m-%d %H:%M')
             st.dataframe(
                 disp.style.apply(
-                    lambda r: ['background-color:#1b3d2e;color:#4caf50']*len(r) if r['Result']=='WIN'
-                    else ['background-color:#3d1a1a;color:#f44336']*len(r)
+                    lambda r: ['background-color:#0d2e12;color:#4caf50']*len(r) if r['Result']=='WIN'
+                    else ['background-color:#2e0d0d;color:#f44336']*len(r)
                     for _ in r
-                ), axis=1,
-                use_container_width=True, height=400
+                ), axis=1, use_container_width=True, height=380
             )
+
             csv = td.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                "📥 Download Full CSV",
-                csv,
-                f"backtest_{bt_sym_saved}_{bt_tf_saved}_{bt_strat_saved}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                "text/csv"
-            )
+            st.download_button("📥 Download CSV", csv, f"bt_{sym_b}_{tf_b}_{strat_b}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", "text/csv")
+
+            # MT5 JSON signal export
+            if not td.empty:
+                mt5_data = {
+                    "generated_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+                    "symbol": sym_b, "timeframe": tf_b, "strategy": strat_b,
+                    "total_trades": m['total'], "net_pnl": m['total_pnl'],
+                    "win_rate": m['win_rate'], "profit_factor": str(m['profit_factor']),
+                    "parameters": {k: v for k, v in par_b.items() if not callable(v)},
+                    "trades": [
+                        {
+                            "entry_time": str(r['entry_time']), "direction": r['signal'],
+                            "entry": r['entry'], "sl": r['sl'], "tp": r['tp'],
+                            "rr": r['rr'], "result": r['result'],
+                            "pnl_pips": r['pnl_pips'], "score": r['score'],
+                        }
+                        for _, r in td.iterrows()
+                    ]
+                }
+                mt5_bytes = json.dumps(mt5_data, indent=2).encode('utf-8')
+                st.download_button("🤖 Download MT5 JSON", mt5_bytes,
+                    f"mt5_{sym_b}_{tf_b}_{strat_b}_{datetime.now().strftime('%Y%m%d')}.json",
+                    "application/json", key="mt5_json_dl")
     else:
-        st.info("👆 Select symbol, timeframe, and strategy above, then click **Run Backtest**.")
+        st.info("👆 Select settings and click **Run Backtest**.")
 
 # ═══════════════════════════════════════════════════
 # TAB 3: SCANNER
 # ═══════════════════════════════════════════════════
 with tab3:
-    st.header("🔴 Multi-Pair Live Scanner")
+    st.header("🔴 Multi-Pair Scanner")
 
     # Alert settings
-    with st.expander("⚙️ Alert Settings", expanded=False):
+    with st.expander("⚙️ Alert Settings", expanded=True):
         ac = st.session_state.alert_config
-        ac['min_score'] = st.slider("🔔 Min Score Alert", 30, 95, ac['min_score'], key="alert_score")
-        ac['min_rr'] = st.slider("📐 Min R:R Alert", 0.5, 3.0, float(ac['min_rr']), 0.1, key="alert_rr")
-        ac['pairs'] = st.multiselect("Pairs to scan", ALL_PAIRS, default=ac.get('pairs', ALL_PAIRS[:4]), key="alert_pairs")
+        ac_col1, ac_col2, ac_col3 = st.columns([1, 1, 1])
+        with ac_col1:
+            ac['min_score'] = st.slider("🔔 Min Score", 20, 95, ac['min_score'], key="alert_sc")
+        with ac_col2:
+            ac['min_rr'] = st.slider("📐 Min R:R", 0.5, 3.0, float(ac['min_rr']), 0.1, key="alert_rr")
+        with ac_col3:
+            ac['sound_enabled'] = st.checkbox("🔔 Sound Alert", value=ac.get('sound_enabled', True), key="alert_snd")
+        ac['pairs'] = st.multiselect("Pairs to scan", ALL_PAIRS, default=ac.get('pairs', ALL_PAIRS[:4]), key="alert_prs")
+        st.session_state.alert_config = ac
 
+    # Active scan settings display
     st.info(
-        f"⏱️ Auto-refresh 10s | TF: {TF_LABEL.get(tf, tf)} | "
-        f"Strategy: {active_strat} | Score≥{st.session_state.alert_config['min_score']} | R:R≥{st.session_state.alert_config['min_rr']} | "
-        f"{', '.join(st.session_state.alert_config.get('pairs', []))}"
+        f"⏱️ Auto 10s | 📌 {active} | "
+        f"Score≥{ac['min_score']} | R:R≥{ac['min_rr']} | "
+        f"Pairs: {', '.join(ac.get('pairs', [])) or 'None'}"
     )
 
-    refresh_count = st_autorefresh(interval=10000, key="scanner_v4")
+    refresh_count = st_autorefresh(interval=10000, key="scanner_v5")
     st.session_state.refresh_count = refresh_count
 
     # Decrement cooldown
     for k in list(st.session_state.pair_cooldown.keys()):
         st.session_state.pair_cooldown[k] = max(0, st.session_state.pair_cooldown[k] - 1)
 
-    signals = scan_all_pairs(active_strat, params)
+    signals = scan_all_pairs(active, params)
 
     if signals:
         signals.sort(key=lambda x: x['score'], reverse=True)
         sig_ids = {id(s) for s in signals}
         new_sigs = [s for s in signals if id(s) not in st.session_state.last_signal_hashes]
+
+        # Sound alert for new signals
+        if new_sigs and ac.get('sound_enabled'):
+            st.markdown(SOUND_JS, unsafe_allow_html=True)
+
         for s in new_sigs:
-            st.toast(f"📢 {s['signal']} {s['symbol']} @ {s['entry']} (score:{s['score']}, R:R:1:{s['rr']})", icon="📈")
+            st.toast(f"📢 NEW: {s['signal']} {s['symbol']} @ {s['entry']} (score:{s['score']}, R:R:1:{s['rr']})", icon="📈")
+
         st.session_state.last_signal_hashes = sig_ids
 
+        # Signal cards
         for sig in signals:
             st.markdown(signal_card(sig), unsafe_allow_html=True)
 
+        # Table
         rows = []
         for s in signals:
             rows.append({
-                'Pair': s['symbol'], 'Signal': s['signal'],
+                'Pair': s['symbol'], 'Dir': s['signal'],
                 'Entry': s['entry'], 'SL': s['sl'], 'TP': s['tp'],
                 'R:R': f"1:{s['rr']}", 'Score': s['score'],
                 'RSI': s['rsi'], 'ATR': s['atr'],
-                'Time': str(s['time'])[:19], 'TF': s.get('timeframe', tf),
+                'Time': str(s['time'])[:19],
             })
         tbl = pd.DataFrame(rows)
         st.dataframe(
             tbl.style.apply(
-                lambda r: ['background-color:#1b3d2e;color:#4caf50']*len(r) if r['Signal']=='BUY'
-                else ['background-color:#3d1a1a;color:#f44336']*len(r)
+                lambda r: ['background-color:#0d2e12;color:#4caf50']*len(r) if r['Dir']=='BUY'
+                else ['background-color:#2e0d0d;color:#f44336']*len(r)
                 for _ in r
             ), use_container_width=True
         )
 
+        # Metrics
         strong = [s for s in signals if s['score'] >= 75]
-        ms1, ms2, ms3 = st.columns(3)
-        ms1.metric("🟢 Strong (≥75)", len(strong))
-        ms2.metric("📊 Total Signals", len(signals))
         avg_rr = sum(s['rr'] for s in signals) / len(signals) if signals else 0
-        ms3.metric("📐 Avg R:R", f"1:{avg_rr:.2f}")
+        sc1, sc2, sc3 = st.columns(3)
+        sc1.metric("🟢 Strong (≥75)", len(strong))
+        sc2.metric("📊 Total Signals", len(signals))
+        sc3.metric("📐 Avg R:R", f"1:{avg_rr:.2f}")
 
+        # Update cooldowns
         for s in signals:
-            st.session_state.pair_cooldown[s['symbol']] = params['cooldown']
+            st.session_state.pair_cooldown[s['symbol']] = params.get('cooldown', 0)
 
         st.session_state.signal_history.extend(signals)
         st.session_state.signal_history = st.session_state.signal_history[-50:]
+
+        # MT5 signal file download for active signals
+        if signals:
+            mt5_bytes = mt5_signal_file(dash_sym if 'dash_sym' in dir() else "EURUSD", signals)
+            st.download_button(
+                "🤖 Export MT5 Signals (JSON)",
+                mt5_bytes,
+                f"mt5_signals_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
+                "application/json",
+            )
     else:
         st.warning(
             "⚠️ **No signals.**\n\n"
-            "Try: lower Min Score, lower Min ATR%, H1 TF, or "
-            "relax Alert Settings above."
+            "Try: lower min_score, lower min_ATR%, switch to H1, "
+            "or reduce R:R threshold."
         )
 
-    st.caption(f"🕐 {datetime.now().strftime('%H:%M:%S')} UTC | Refresh #{st.session_state.refresh_count} | {active_strat} | Yahoo Finance v8")
+    st.caption(f"🕐 {datetime.now().strftime('%H:%M:%S')} UTC | Refresh #{st.session_state.refresh_count} | {active} | Pinned: {st.session_state.get('pinned_symbol', '—')}")
