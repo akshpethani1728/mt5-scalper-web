@@ -223,14 +223,14 @@ def add_indicators(df: pd.DataFrame, params: dict) -> pd.DataFrame:
     if df is None or df.empty:
         return df
     df = df.copy()
-    df['ema_9'] = ta.trend.EMAIndicator(df['close'], window=params["ema_fast"]).ema_indicator()
-    df['ema_21'] = ta.trend.EMAIndicator(df['close'], window=params["ema_slow"]).ema_indicator()
-    df['ema_20'] = ta.trend.EMAIndicator(df['close'], window=params["ema_trend_fast"]).ema_indicator()
-    df['ema_50'] = ta.trend.EMAIndicator(df['close'], window=params["ema_trend_slow"]).ema_indicator()
+    df['ema_fast'] = ta.trend.EMAIndicator(df['close'], window=params["ema_fast"]).ema_indicator()
+    df['ema_slow'] = ta.trend.EMAIndicator(df['close'], window=params["ema_slow"]).ema_indicator()
+    df['ema_trend_fast'] = ta.trend.EMAIndicator(df['close'], window=params["ema_trend_fast"]).ema_indicator()
+    df['ema_trend_slow'] = ta.trend.EMAIndicator(df['close'], window=params["ema_trend_slow"]).ema_indicator()
     df['rsi'] = ta.momentum.RSIIndicator(df['close'], window=params["rsi_period"]).rsi()
     df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=params["atr_period"]).average_true_range()
     df['atr_pct'] = df['atr'] / df['close']
-    df['trend_dist'] = abs(df['ema_20'] - df['ema_50'])
+    df['trend_dist'] = abs(df['ema_trend_fast'] - df['ema_trend_slow'])
     df['candle_range'] = df['high'] - df['low']
     df['candle_body'] = abs(df['close'] - df['open'])
     df['candle_body_pct'] = (df['candle_body'] / df['candle_range'].replace(0, np.nan)).fillna(0).clip(0, 1)
@@ -250,6 +250,14 @@ def swing_low(df, idx, lookback):
 def session_active(dt) -> bool:
     h = dt.hour
     return (8 <= h < 12) or (13 <= h <= 17)
+
+
+# ─── patched session check that backtest can override ────────────────────────
+def _check_session(dt, params) -> bool:
+    """Returns True if session filter passes, or if _no_session_filter is set."""
+    if params.get("_no_session_filter"):
+        return True
+    return session_active(dt)
 
 def get_sessions(dt):
     h = dt.hour
@@ -307,10 +315,10 @@ def calc_sl(signal, entry, df, idx, params):
             sl = min_sl
     return sl
 
-def calc_tp(signal, entry, sl, df, idx, params):
+def calc_tp(signal, entry, sl, df, idx, params, symbol: str = None):
     if params.get('use_tp_fixed') and params.get('tp_pips'):
-        # Micro Scalp: fixed TP in pips
-        pip_val = 0.0001 if 'JPY' not in df.iloc[idx]['close'] else 0.01
+        # Micro Scalp / Quick Scalp: fixed TP in pips
+        pip_val = 0.01 if (symbol and 'JPY' in symbol) else 0.0001
         tp_pips = params['tp_pips']
         return entry + (tp_pips * pip_val) if signal == 'BUY' else entry - (tp_pips * pip_val)
     # Dynamic TP
@@ -345,34 +353,34 @@ def find_signal(df, idx, strategy, params):
 
 def _sig_pullback_ema(df, idx, params):
     row, prev = df.iloc[idx], df.iloc[idx - 1]
-    cross_up = prev['ema_9'] <= prev['ema_21'] and row['ema_9'] > row['ema_21']
-    cross_down = prev['ema_9'] >= prev['ema_21'] and row['ema_9'] < row['ema_21']
+    cross_up = prev['ema_fast'] <= prev['ema_slow'] and row['ema_fast'] > row['ema_slow']
+    cross_down = prev['ema_fast'] >= prev['ema_slow'] and row['ema_fast'] < row['ema_slow']
     if not (cross_up or cross_down): return None
     direction = 'BUY' if cross_up else 'SELL'
-    if direction == 'BUY' and not (row['ema_20'] > row['ema_50']): return None
-    if direction == 'SELL' and not (row['ema_20'] < row['ema_50']): return None
+    if direction == 'BUY' and not (row['ema_trend_fast'] > row['ema_trend_slow']): return None
+    if direction == 'SELL' and not (row['ema_trend_fast'] < row['ema_trend_slow']): return None
     if direction == 'BUY' and not (row['rsi'] > 50 and row['rsi_change'] > 0): return None
     if direction == 'SELL' and not (row['rsi'] < 50 and row['rsi_change'] < 0): return None
     if row['trend_dist'] < params['min_trend_dist_pct']: return None
     if row['atr_pct'] < params['min_atr_pct']: return None
     body = row['candle_body_pct'] if not np.isnan(row['candle_body_pct']) else 0
     if body < params['candle_body_min']: return None
-    if not session_active(row['time']): return None
+    if not _check_session(row['time'], params): return None
     return direction
 
 
 def _sig_ema_crossover(df, idx, params):
     row, prev = df.iloc[idx], df.iloc[idx - 1]
-    cross_up = prev['ema_9'] <= prev['ema_21'] and row['ema_9'] > row['ema_21']
-    cross_down = prev['ema_9'] >= prev['ema_21'] and row['ema_9'] < row['ema_21']
+    cross_up = prev['ema_fast'] <= prev['ema_slow'] and row['ema_fast'] > row['ema_slow']
+    cross_down = prev['ema_fast'] >= prev['ema_slow'] and row['ema_fast'] < row['ema_slow']
     if not (cross_up or cross_down): return None
     direction = 'BUY' if cross_up else 'SELL'
-    if direction == 'BUY' and row['close'] <= row['ema_50']: return None
-    if direction == 'SELL' and row['close'] >= row['ema_50']: return None
+    if direction == 'BUY' and row['close'] <= row['ema_trend_slow']: return None
+    if direction == 'SELL' and row['close'] >= row['ema_trend_slow']: return None
     if row['atr_pct'] < params['min_atr_pct']: return None
     body = row['candle_body_pct'] if not np.isnan(row['candle_body_pct']) else 0
     if body < params['candle_body_min']: return None
-    if not session_active(row['time']): return None
+    if not _check_session(row['time'], params): return None
     return direction
 
 
@@ -382,24 +390,24 @@ def _sig_rsi_range(df, idx, params):
     rsi_cross_down = prev['rsi'] > params.get('rsi_sell_min', 65) and row['rsi'] <= params.get('rsi_sell_min', 65)
     if not (rsi_cross_up or rsi_cross_down): return None
     direction = 'BUY' if rsi_cross_up else 'SELL'
-    if direction == 'BUY' and not (row['ema_20'] > row['ema_50']): return None
-    if direction == 'SELL' and not (row['ema_20'] < row['ema_50']): return None
+    if direction == 'BUY' and not (row['ema_trend_fast'] > row['ema_trend_slow']): return None
+    if direction == 'SELL' and not (row['ema_trend_fast'] < row['ema_trend_slow']): return None
     if row['atr_pct'] < params['min_atr_pct']: return None
-    if not session_active(row['time']): return None
+    if not _check_session(row['time'], params): return None
     return direction
 
 
 def _sig_atr_breakout(df, idx, params):
     row, prev = df.iloc[idx], df.iloc[idx - 1]
-    buy_cond = row['close'] > row['ema_9'] and row['atr_pct'] > params['min_atr_pct']
-    sell_cond = row['close'] < row['ema_9'] and row['atr_pct'] > params['min_atr_pct']
+    buy_cond = row['close'] > row['ema_fast'] and row['atr_pct'] > params['min_atr_pct']
+    sell_cond = row['close'] < row['ema_fast'] and row['atr_pct'] > params['min_atr_pct']
     if not (buy_cond or sell_cond): return None
     direction = 'BUY' if buy_cond else 'SELL'
-    if direction == 'BUY' and not (row['ema_20'] > row['ema_50']): return None
-    if direction == 'SELL' and not (row['ema_20'] < row['ema_50']): return None
+    if direction == 'BUY' and not (row['ema_trend_fast'] > row['ema_trend_slow']): return None
+    if direction == 'SELL' and not (row['ema_trend_fast'] < row['ema_trend_slow']): return None
     body = row['candle_body_pct'] if not np.isnan(row['candle_body_pct']) else 0
     if body < params['candle_body_min']: return None
-    if not session_active(row['time']): return None
+    if not _check_session(row['time'], params): return None
     return direction
 
 
@@ -407,31 +415,24 @@ def _sig_micro_scalp(df, idx, params):
     """
     ⚡ Micro Scalp: EMA3/7 ultra-fast cross within EMA20/50 trend.
     Targets multiple trades per hour with tight 0.5×ATR SL and fixed TP.
-    RSI momentum confirms. Session filter OFF for max signals.
+    RSI momentum confirms. No session filter for max signals.
     """
     row, prev = df.iloc[idx], df.iloc[idx - 1]
-    # EMA3 crosses EMA7
-    cross_up = prev['ema_9'] <= prev['ema_21'] and row['ema_9'] > row['ema_21']
-    cross_down = prev['ema_9'] >= prev['ema_21'] and row['ema_9'] < row['ema_21']
-    # For micro scalp use ema_fast=3 (ema_9 holds value of ema_fast) and ema_slow=7
-    # We use ema_21 for the fast cross since we only have 4 EMA columns
-    # Actually we need to detect EMA3/7 cross — let's use close vs ema_fast directly
-    # Since ema_9 = EMA3 (mapped), ema_21 = EMA7 (mapped)
-    cross_up = prev['ema_9'] <= prev['ema_21'] and row['ema_9'] > row['ema_21']
-    cross_down = prev['ema_9'] >= prev['ema_21'] and row['ema_9'] < row['ema_21']
+    cross_up = prev['ema_fast'] <= prev['ema_slow'] and row['ema_fast'] > row['ema_slow']
+    cross_down = prev['ema_fast'] >= prev['ema_slow'] and row['ema_fast'] < row['ema_slow']
     if not (cross_up or cross_down): return None
     direction = 'BUY' if cross_up else 'SELL'
-    # Trend: EMA20 > EMA50 for BUY
-    if direction == 'BUY' and not (row['ema_20'] > row['ema_50']): return None
-    if direction == 'SELL' and not (row['ema_20'] < row['ema_50']): return None
-    # RSI momentum
+    if direction == 'BUY' and not (row['ema_trend_fast'] > row['ema_trend_slow']): return None
+    if direction == 'SELL' and not (row['ema_trend_fast'] < row['ema_trend_slow']): return None
     if direction == 'BUY' and not (row['rsi'] > 50): return None
     if direction == 'SELL' and not (row['rsi'] < 50): return None
-    # ATR filter (minimal — tight SL so need some vol)
     if row['atr_pct'] < params['min_atr_pct']: return None
-    # Body filter (minimal)
     body = row['candle_body_pct'] if not np.isnan(row['candle_body_pct']) else 0
     if body < params['candle_body_min']: return None
+    # No session filter — trade all day for max signals
+    return direction
+
+
 def _sig_quick_scalp(df, idx, params):
     """
     ⚡⚡ Quick Scalp: Ultra-fast EMA2/5 cross within EMA8/20 trend.
@@ -439,23 +440,18 @@ def _sig_quick_scalp(df, idx, params):
     No session filter. Designed for 3-10+ trades per hour.
     """
     row, prev = df.iloc[idx], df.iloc[idx - 1]
-    # EMA2 crosses EMA5 (ema_9 = EMA2, ema_21 = EMA5 via fast/slow params)
-    cross_up = prev['ema_9'] <= prev['ema_21'] and row['ema_9'] > row['ema_21']
-    cross_down = prev['ema_9'] >= prev['ema_21'] and row['ema_9'] < row['ema_21']
+    cross_up = prev['ema_fast'] <= prev['ema_slow'] and row['ema_fast'] > row['ema_slow']
+    cross_down = prev['ema_fast'] >= prev['ema_slow'] and row['ema_fast'] < row['ema_slow']
     if not (cross_up or cross_down): return None
     direction = 'BUY' if cross_up else 'SELL'
-    # Trend: EMA8 > EMA20 for BUY
-    if direction == 'BUY' and not (row['ema_20'] > row['ema_50']): return None
-    if direction == 'SELL' and not (row['ema_20'] < row['ema_50']): return None
-    # RSI momentum (minimal filter)
+    if direction == 'BUY' and not (row['ema_trend_fast'] > row['ema_trend_slow']): return None
+    if direction == 'SELL' and not (row['ema_trend_fast'] < row['ema_trend_slow']): return None
     if direction == 'BUY' and not (row['rsi'] > 50): return None
     if direction == 'SELL' and not (row['rsi'] < 50): return None
-    # Minimal ATR filter (tight SL needs some vol)
     if row['atr_pct'] < params['min_atr_pct']: return None
-    # Minimal body filter
     body = row['candle_body_pct'] if not np.isnan(row['candle_body_pct']) else 0
     if body < params['candle_body_min']: return None
-    # NO session filter — trade all day
+    # No session filter — trade all day
     return direction
 
 # ============================================================================
@@ -481,7 +477,7 @@ def scan_pair(symbol: str, interval: str, strategy: str, params: dict) -> dict |
             continue
         entry = df.iloc[ci]['close']
         sl = calc_sl(direction, entry, df, ci, params)
-        tp = calc_tp(direction, entry, sl, df, ci, params)
+        tp = calc_tp(direction, entry, sl, df, ci, params, symbol)
         risk = abs(entry - sl)
         reward = abs(tp - entry)
         rr = round(reward / risk, 2) if risk > 0 else 0
@@ -582,7 +578,7 @@ def run_backtest(symbol: str, candles: int, interval: str, strategy: str, params
             if score >= params['min_score']:
                 entry = df.iloc[i]['close']
                 sl = calc_sl(direction, entry, df, i, params)
-                tp = calc_tp(direction, entry, sl, df, i, params)
+                tp = calc_tp(direction, entry, sl, df, i, params, symbol)
                 position = direction
                 pos_entry, pos_sl, pos_tp = entry, sl, tp
                 pos_score, pos_time = score, df.iloc[i]['time']
@@ -708,13 +704,13 @@ def plot_chart(df, trades_df=None, sig=None):
         increasing_line_color='#26a69a', decreasing_line_color='#ef5350',
         name='Price', hoverinfo='x+y'
     ), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df['time'], y=df['ema_9'], name='EMA Fast',
+    fig.add_trace(go.Scatter(x=df['time'], y=df['ema_fast'], name=f"EMA{dash_params['ema_fast']}",
         line=dict(color='#2196F3', width=1.5), hoverinfo='y'), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df['time'], y=df['ema_21'], name='EMA Slow',
+    fig.add_trace(go.Scatter(x=df['time'], y=df['ema_slow'], name=f"EMA{dash_params['ema_slow']}",
         line=dict(color='#FF9800', width=1.5), hoverinfo='y'), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df['time'], y=df['ema_20'], name='EMA20',
+    fig.add_trace(go.Scatter(x=df['time'], y=df['ema_trend_fast'], name=f"EMA{dash_params['ema_trend_fast']}",
         line=dict(color='#00BCD4', width=1.2, dash='dash'), opacity=0.7, hoverinfo='y'), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df['time'], y=df['ema_50'], name='EMA50',
+    fig.add_trace(go.Scatter(x=df['time'], y=df['ema_trend_slow'], name=f"EMA{dash_params['ema_trend_slow']}",
         line=dict(color='#E91E63', width=1.2, dash='dash'), opacity=0.7, hoverinfo='y'), row=1, col=1)
 
     if 'volume' in df.columns and df['volume'].sum() > 0:
@@ -877,8 +873,9 @@ def monthly_heatmap(metrics):
     if not records:
         return None
     mr = pd.DataFrame(records)
+    mr['month'] = mr['month'].astype(str)
     fig = go.Figure(data=go.Heatmap(
-        x=mr['month'].astype(str), y=['P&L'],
+        x=mr['month'], y=['P&L'],
         z=mr['pnl'], text=mr[['pnl', 'count']].apply(lambda r: f"{r['pnl']:.0f}p / {r['count']}t", axis=1),
         texttemplate="%{text}", textfont={"color": "white"},
         colorscale='RdYlGn', zmid=0,
@@ -1081,7 +1078,7 @@ with tab1:
             index=ALL_PAIRS.index(pinned) if pinned in ALL_PAIRS else 0, key="dash_sym")
         st.session_state["scanner_symbol"] = dash_sym
     with col_tf:
-        dash_tf = st.selectbox("TF", ["M1", "M5", "H1"], index=["M1", "M5", "H1"].index(tf), key="dash_tf")
+        dash_tf = st.selectbox("TF", ["M1", "M5", "H1"], index=["M1", "M5", "H1"].index(st.session_state.get("active_tf", "M1")), key="dash_tf")
     with col_strat:
         dash_strat = st.selectbox("Strategy", list(STRATEGIES.keys()),
             index=list(STRATEGIES.keys()).index(active), key="dash_strat_v2")
@@ -1112,17 +1109,17 @@ with tab1:
         last = df_dash.iloc[-1]
         age = (datetime.now() - last['time']).total_seconds() / 60
         fc = "🟢" if age < 15 else "🟡" if age < 60 else "🔴"
-        trend_dir = "🟢 UP" if last['ema_20'] > last['ema_50'] else "🔴 DOWN"
+        trend_dir = "🟢 UP" if last['ema_trend_fast'] > last['ema_trend_slow'] else "🔴 DOWN"
         rsi_str, rsi_col = rsi_display(float(last['rsi']))
 
         st.caption(f"{fc} {len(df_dash)} candles | {last['time'].strftime('%Y-%m-%d %H:%M')} UTC | Yahoo v8 | 📌 {dash_strat} on {dash_sym}")
 
         c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
         c1.metric("Price", f"{last['close']:.5f}")
-        c2.metric(f"EMA{dash_params['ema_fast']}", f"{last['ema_9']:.5f}")
-        c3.metric(f"EMA{dash_params['ema_slow']}", f"{last['ema_21']:.5f}")
-        c4.metric("EMA20", f"{last['ema_20']:.5f}")
-        c5.metric("EMA50", f"{last['ema_50']:.5f}")
+        c2.metric(f"EMA{dash_params['ema_fast']}", f"{last['ema_fast']:.5f}")
+        c3.metric(f"EMA{dash_params['ema_slow']}", f"{last['ema_slow']:.5f}")
+        c4.metric(f"EMA{dash_params['ema_trend_fast']}", f"{last['ema_trend_fast']:.5f}")
+        c5.metric(f"EMA{dash_params['ema_trend_slow']}", f"{last['ema_trend_slow']:.5f}")
         c6.markdown(f"<div style='text-align:center;padding:4px 0;'><small>RSI</small><br><b style='color:{rsi_col};'>{rsi_str}</b></div>", unsafe_allow_html=True)
         c7.metric("ATR", f"{last['atr']:.5f}")
         c8.metric("Trend", trend_dir)
@@ -1172,19 +1169,25 @@ with tab2:
     st.header("📈 Backtest")
     st.caption(f"Strategy parameters from sidebar apply | SL: ATR×{params.get('sl_atr_mult','?')} | TP: {'fixed ' + str(params.get('tp_pips','?')) + 'pips' if params.get('use_tp_fixed') else 'dynamic'} | Session: London+NY | Cooldown: {params.get('cooldown',0)}")
 
-    bk_col1, bk_col2, bk_col3, bk_col4 = st.columns([2, 1, 1, 1])
+    bk_col1, bk_col2, bk_col3, bk_col4, bk_col5 = st.columns([2, 1, 2, 1, 1])
     with bk_col1:
         bt_sym = st.selectbox("Symbol", ALL_PAIRS, index=0, key="bt_sym")
     with bk_col2:
-        bt_tf = st.selectbox("TF", ["M1", "M5", "H1"], index=["M1", "M5", "H1"].index(tf), key="bt_tf")
+        bt_tf = st.selectbox("TF", ["M1", "M5", "H1"], index=["M1", "M5", "H1"].index(st.session_state.get("active_tf", "M1")), key="bt_tf")
     with bk_col3:
         bt_strat = st.selectbox("Strategy", list(STRATEGIES.keys()),
             index=list(STRATEGIES.keys()).index(active), key="bt_strat")
     with bk_col4:
-        bt_candles = st.selectbox("Candles", [300, 500, 1000, 1500, 2000, 3000], index=3, key="bt_candles")
+        bt_candles = st.selectbox("Candles", [500, 1000, 1500, 2000, 3000], index=2, key="bt_candles")
+    with bk_col5:
+        bt_no_session = st.checkbox("No Session Filter", value=False, key="bt_no_session")
 
     bt_params = STRATEGIES[bt_strat]["params"].copy()
     bt_params.update({k: v for k, v in params.items() if k in bt_params})
+
+    # Allow overriding session filter from backtest tab
+    if bt_no_session:
+        bt_params["_no_session_filter"] = True
 
     if st.button("▶️ Run Backtest", use_container_width=True, type="primary", key="run_bt_v3"):
         with st.spinner(f"{bt_strat} on {bt_sym} [{bt_tf}] — {bt_candles} candles..."):
@@ -1193,9 +1196,9 @@ with tab2:
 
     bt_res = st.session_state.get("bt_result")
     if bt_res:
-        td, df_bt, m, sym_b, tf_b, strat_b, par_b = bt_res
+        td, df_bt, m, sym_b, tf_b, strat_b, par_b = bt_res[:7]
         if m is None:
-            st.error(f"❌ No trades for {sym_b} [{tf_b}] using {strat_b}. Try: lower min_score, lower min_ATR%, more candles, or H1 TF.")
+            st.error(f"❌ No trades for {sym_b} [{tf_b}] using {strat_b}. Try: more candles, enable 'No Session Filter', lower min_score, or switch TF.")
         else:
             # ── Row 1: Core Stats ──────────────────────────────────────────────
             st.markdown("### 📊 Performance Summary")
