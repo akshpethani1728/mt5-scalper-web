@@ -49,12 +49,8 @@ CHART_LAYOUT = dict(
     showlegend=True,
     legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
     xaxis_rangeslider_visible=False,
-    scrollZoom=False,
-    dragmode='pan',
     hovermode='x unified',
     margin=dict(l=40, r=20, t=40, b=40),
-    doubleClick=False,
-    editable=False,
 )
 
 # ============================================================================
@@ -759,11 +755,8 @@ def plot_chart(df, trades_df=None, sig=None):
         template='plotly_dark', height=720, showlegend=True,
         legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
         xaxis_rangeslider_visible=False,
-        scrollZoom=False,
-        dragmode='pan',
         hovermode='x unified',
         margin=dict(l=50, r=20, t=30, b=40),
-        chart_border_width=1, chart_border_color='#333',
     )
     return fig
 
@@ -788,7 +781,6 @@ def equity_chart(td):
         template='plotly_dark', height=220,
         xaxis_title="Trade #", yaxis_title="P&L (pips)",
         hovermode='x unified', margin=dict(l=50, r=20, t=10, b=40),
-        scrollZoom=False, dragmode='pan',
     )
     fig.add_hline(y=0, line_dash='dot', line_color='gray', line_width=0.5)
     return fig
@@ -815,7 +807,6 @@ def drawdown_chart(td):
         template='plotly_dark', height=170,
         xaxis_title="Trade #", yaxis_title="Drawdown (pips)",
         hovermode='x unified', margin=dict(l=50, r=20, t=10, b=40),
-        scrollZoom=False, dragmode='pan',
     )
     fig.add_hline(y=0, line_dash='dot', line_color='gray', line_width=0.5)
     return fig
@@ -836,7 +827,7 @@ def pnl_dist_chart(td):
         template='plotly_dark', height=200,
         xaxis_title="P&L (pips)", yaxis_title="Count",
         barmode='overlay', margin=dict(l=50, r=20, t=10, b=40),
-        hovermode='x unified', scrollZoom=False, dragmode='pan',
+        hovermode='x unified',
     )
     return fig
 
@@ -860,7 +851,7 @@ def hourly_chart(metrics):
         template='plotly_dark', height=200,
         xaxis_title="Hour (UTC)", yaxis_title="Net P&L (pips)",
         coloraxis=dict(colorscale='RdYlGn'), margin=dict(l=50, r=20, t=10, b=40),
-        hovermode='x unified', scrollZoom=False, dragmode='pan',
+        hovermode='x unified',
     )
     return fig
 
@@ -885,7 +876,6 @@ def monthly_heatmap(metrics):
         template='plotly_dark', height=120,
         xaxis_title="Month", yaxis_title="",
         margin=dict(l=50, r=20, t=10, b=40),
-        scrollZoom=False, dragmode='pan',
     )
     return fig
 
