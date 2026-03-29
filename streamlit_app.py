@@ -3,6 +3,7 @@ MT5 Scalper Pro — Real-Time Trading Assistant
 =============================================
 Multi-strategy scalping dashboard with 6 strategies including Micro Scalp & Quick Scalp for high-frequency M1 trading.
 Features:
+  - Centralized PAIR_CONFIG (edit one place to change supported pairs globally)
   - TradingView-style chart (no zoom, pan only, double-click/annotation editing disabled)
   - 6 strategies: Pullback EMA, EMA Crossover, RSI Range, ATR Breakout, Micro Scalp, Quick Scalp
   - MT5 signal file export (JSON for Expert Advisor import)
@@ -33,12 +34,36 @@ import ta
 # CONSTANTS
 # ============================================================================
 
-ALL_PAIRS = ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD", "AUDUSD", "USDCAD", "NZDUSD", "GBPAUD"]
-YF_MAP = {
-    "EURUSD": "EURUSD=X", "GBPUSD": "GBPUSD=X", "USDJPY": "USDJPY=X",
-    "XAUUSD": "GC=F", "AUDUSD": "AUDUSD=X", "USDCAD": "USDCAD=X",
-    "NZDUSD": "NZDUSD=X", "GBPAUD": "GBPAUD=X",
+# ============================================================================
+# PAIR CONFIGURATION — Edit this section to change supported pairs globally
+# ============================================================================
+PAIR_CONFIG = {
+    "EURUSD": {"yf_ticker": "EURUSD=X", "type": "forex",  "pip": 0.0001, "digits": 5},
+    "GBPUSD": {"yf_ticker": "GBPUSD=X", "type": "forex",  "pip": 0.0001, "digits": 5},
+    "USDJPY": {"yf_ticker": "USDJPY=X", "type": "forex",  "pip": 0.01,   "digits": 3},
+    "XAUUSD": {"yf_ticker": "GC=F",     "type": "metal",  "pip": 0.01,   "digits": 2},
+    "AUDUSD": {"yf_ticker": "AUDUSD=X", "type": "forex",  "pip": 0.0001, "digits": 5},
+    "USDCAD": {"yf_ticker": "USDCAD=X", "type": "forex",  "pip": 0.0001, "digits": 5},
+    "NZDUSD": {"yf_ticker": "NZDUSD=X", "type": "forex",  "pip": 0.0001, "digits": 5},
+    "GBPAUD": {"yf_ticker": "GBPAUD=X", "type": "forex",  "pip": 0.0001, "digits": 5},
 }
+
+def get_pairs():
+    """Returns list of enabled pair names from PAIR_CONFIG."""
+    return list(PAIR_CONFIG.keys())
+
+def get_yf_ticker(pair: str) -> str:
+    return PAIR_CONFIG.get(pair, {}).get("yf_ticker", pair)
+
+def get_pip_value(pair: str) -> float:
+    return PAIR_CONFIG.get(pair, {}).get("pip", 0.0001)
+
+def is_jpy_pair(pair: str) -> bool:
+    return "JPY" in pair.upper()
+
+# Legacy aliases for backward compatibility
+ALL_PAIRS = list(PAIR_CONFIG.keys())
+YF_MAP = {pair: cfg["yf_ticker"] for pair, cfg in PAIR_CONFIG.items()}
 TF_INTERVAL = {"M1": "1m", "M5": "5m", "H1": "60m"}
 TF_PERIOD = {"M1": "5d", "M5": "5d", "H1": "60d"}
 TF_LABEL = {"M1": "1 Min", "M5": "5 Min", "H1": "1 Hr"}
@@ -144,14 +169,14 @@ def init_session():
     defaults = {
         "signal_history": [],
         "selected_pairs": ALL_PAIRS[:4],
-        "last_signal_hashes": set(),
+        "last_signal_hashes": [],
         "refresh_count": 0,
         "pair_cooldown": {},
         "bt_result": None,
-        "pinned_symbol": "EURUSD",
+        "pinned_symbol": ALL_PAIRS[0],
         "alert_config": {"min_score": 50, "min_rr": 0.8, "sound_enabled": True, "pairs": ALL_PAIRS[:4]},
         "mt5_signal": None,
-        "scanner_symbol": "EURUSD",
+        "scanner_symbol": ALL_PAIRS[0],
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -314,7 +339,7 @@ def calc_sl(signal, entry, df, idx, params):
 def calc_tp(signal, entry, sl, df, idx, params, symbol: str = None):
     if params.get('use_tp_fixed') and params.get('tp_pips'):
         # Micro Scalp / Quick Scalp: fixed TP in pips
-        pip_val = 0.01 if (symbol and 'JPY' in symbol) else 0.0001
+        pip_val = get_pip_value(symbol)
         tp_pips = params['tp_pips']
         return entry + (tp_pips * pip_val) if signal == 'BUY' else entry - (tp_pips * pip_val)
     # Dynamic TP
@@ -518,7 +543,7 @@ def generate_mt5_signal(sig: dict, params: dict) -> dict:
     Creates a JSON signal that can be written to a file for MT5 EA to read.
     Format compatible with common MT5 file-based signal systems.
     """
-    pip_val = 0.0001 if 'JPY' not in sig['symbol'] else 0.01
+    pip_val = get_pip_value(sig['symbol'])
     sl_pips = abs(sig['entry'] - sig['sl']) / pip_val
     tp_pips = abs(sig['tp'] - sig['entry']) / pip_val
     return {
@@ -594,7 +619,7 @@ def run_backtest(symbol: str, candles: int, interval: str, strategy: str, params
                 reward = abs(exit_p - pos_entry)
                 rr = round(reward / risk, 2) if risk > 0 else 0
                 pnl = (reward - risk) * 10000 if result == 'WIN' else -(risk * 10000)
-                pip_val = 0.0001 if 'JPY' not in symbol else 0.01
+                pip_val = get_pip_value(symbol)
                 hold_candles = i - df[df['time'] == pos_time].index[0]
                 trades.append({
                     'signal': position, 'entry': pos_entry, 'exit': exit_p,
@@ -685,9 +710,11 @@ def run_backtest(symbol: str, candles: int, interval: str, strategy: str, params
 # PLOT: CANDLESTICK + INDICATORS (TradingView-like, pan only)
 # ============================================================================
 
-def plot_chart(df, trades_df=None, sig=None):
+def plot_chart(df, trades_df=None, sig=None, params=None):
     if df is None or df.empty:
         return None
+    if params is None:
+        params = {}
     fig = make_subplots(
         rows=4, cols=1, shared_xaxes=True,
         row_heights=[0.40, 0.20, 0.20, 0.20],
@@ -700,13 +727,13 @@ def plot_chart(df, trades_df=None, sig=None):
         increasing_line_color='#26a69a', decreasing_line_color='#ef5350',
         name='Price', hoverinfo='x+y'
     ), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df['time'], y=df['ema_fast'], name=f"EMA{dash_params['ema_fast']}",
+    fig.add_trace(go.Scatter(x=df['time'], y=df['ema_fast'], name=f"EMA{params.get('ema_fast', 9)}",
         line=dict(color='#2196F3', width=1.5), hoverinfo='y'), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df['time'], y=df['ema_slow'], name=f"EMA{dash_params['ema_slow']}",
+    fig.add_trace(go.Scatter(x=df['time'], y=df['ema_slow'], name=f"EMA{params.get('ema_slow', 21)}",
         line=dict(color='#FF9800', width=1.5), hoverinfo='y'), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df['time'], y=df['ema_trend_fast'], name=f"EMA{dash_params['ema_trend_fast']}",
+    fig.add_trace(go.Scatter(x=df['time'], y=df['ema_trend_fast'], name=f"EMA{params.get('ema_trend_fast', 20)}",
         line=dict(color='#00BCD4', width=1.2, dash='dash'), opacity=0.7, hoverinfo='y'), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df['time'], y=df['ema_trend_slow'], name=f"EMA{dash_params['ema_trend_slow']}",
+    fig.add_trace(go.Scatter(x=df['time'], y=df['ema_trend_slow'], name=f"EMA{params.get('ema_trend_slow', 50)}",
         line=dict(color='#E91E63', width=1.2, dash='dash'), opacity=0.7, hoverinfo='y'), row=1, col=1)
 
     if 'volume' in df.columns and df['volume'].sum() > 0:
@@ -906,7 +933,7 @@ def signal_card(sig, show_mt5=False) -> str:
     border = '#4caf50' if is_buy else '#f44336'
     bg = '#0d2e12' if is_buy else '#2e0d0d'
     arrow = '🟢 BUY' if is_buy else '🔴 SELL'
-    pip_val = 0.0001 if 'JPY' not in sig['symbol'] else 0.01
+    pip_val = get_pip_value(sig['symbol'])
     sl_pips = round(abs(sig['entry'] - sig['sl']) / pip_val, 1)
     tp_pips = round(abs(sig['tp'] - sig['entry']) / pip_val, 1)
     return f"""
@@ -981,7 +1008,8 @@ with st.sidebar:
     st.session_state["active_strategy"] = active_strat
     st.caption(f"_{STRATEGIES[active_strat]['description']}_")
 
-    sym_sidebar = st.text_input("📌 Pinned Symbol", value=st.session_state.get("pinned_symbol", "EURUSD")).upper().strip()
+    sym_sidebar = st.selectbox("📌 Pinned Symbol", ALL_PAIRS,
+        index=ALL_PAIRS.index(st.session_state.get("pinned_symbol", ALL_PAIRS[0])) if st.session_state.get("pinned_symbol", ALL_PAIRS[0]) in ALL_PAIRS else 0)
     st.session_state["pinned_symbol"] = sym_sidebar
 
     tf = st.selectbox("⏱️ Timeframe", ["M1", "M5", "H1"], index=0)
@@ -1057,7 +1085,7 @@ with tab1:
     now = datetime.now()
     st.markdown(session_boxes(now), unsafe_allow_html=True)
 
-    pinned = st.session_state.get("pinned_symbol", "EURUSD")
+    pinned = st.session_state.get("pinned_symbol", ALL_PAIRS[0])
     active = st.session_state.get("active_strategy", DEFAULT_STRATEGY)
     params = st.session_state.get("active_params", STRATEGIES[active]["params"].copy())
 
@@ -1115,7 +1143,7 @@ with tab1:
         c8.metric("Trend", trend_dir)
 
         st.markdown("---")
-        fig = plot_chart(df_dash)
+        fig = plot_chart(df_dash, params=dash_params)
         if fig:
             st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': False, 'displayModeBar': True, 'modeBarButtonsToRemove': ['lasso2d', 'select2d', 'autoScale2d', 'hoverCompareCartesian', 'toggleSpikelines'], 'doubleClick': False, 'editable': False})
 
@@ -1129,7 +1157,7 @@ with tab1:
 
             # ── Real Trading: Risk & Position Size Calculator ────────────────────
             with st.expander("🧮 Risk & Position Size Calculator", expanded=False):
-                pip_val = 0.0001 if 'JPY' not in sig['symbol'] else 0.01
+                pip_val = get_pip_value(sig['symbol'])
                 sl_pips_calc = round(abs(sig['entry'] - sig['sl']) / pip_val, 1)
                 tp_pips_calc = round(abs(sig['tp'] - sig['entry']) / pip_val, 1)
                 risk_account = st.number_input("Account Balance ($)", min_value=100.0, value=1000.0, step=50.0, key="risk_account")
@@ -1299,7 +1327,7 @@ with tab2:
 
             st.markdown("### 📊 Price Chart with Trade Markers")
             if df_bt is not None and not df_bt.empty:
-                fig_bt = plot_chart(df_bt, td)
+                fig_bt = plot_chart(df_bt, td, params=par_b)
                 if fig_bt:
                     st.plotly_chart(fig_bt, use_container_width=True, config={'scrollZoom': False, 'displayModeBar': True, 'modeBarButtonsToRemove': ['lasso2d', 'select2d', 'autoScale2d', 'hoverCompareCartesian'], 'doubleClick': False, 'editable': False})
 
@@ -1380,7 +1408,7 @@ with tab3:
 
     if signals:
         signals.sort(key=lambda x: x['score'], reverse=True)
-        sig_ids = {id(s) for s in signals}
+        sig_ids = [id(s) for s in signals]
         new_sigs = [s for s in signals if id(s) not in st.session_state.last_signal_hashes]
 
         # Sound alert for new signals
@@ -1432,7 +1460,7 @@ with tab3:
 
         # MT5 signal file download for active signals
         if signals:
-            mt5_bytes = mt5_signal_file(st.session_state.get("scanner_symbol", "EURUSD"), signals)
+            mt5_bytes = mt5_signal_file(st.session_state.get("scanner_symbol", ALL_PAIRS[0]), signals)
             st.download_button(
                 "🤖 Export MT5 Signals (JSON)",
                 mt5_bytes,
