@@ -1414,53 +1414,35 @@ with tab2:
             now_utc = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
             st.success(f"✅ Backtest complete | {m['total']} trades | {sym_b} [{tf_b}] | {bt_candles} candles | Data fetched in {fetch_ms:.0f}ms | {now_utc}")
 
-            # ── ROW 1: CORE METRICS ────────────────────────────────────────────
+            # ── PERFORMANCE SUMMARY CARDS ─────────────────────────────────────
             st.markdown("#### 📊 Performance Summary")
-            r1c1, r1c2, r1c3, r1c4, r1c5, r1c6 = st.columns(6)
+            # Row 1: Key metrics in 4 clean cards
+            s1, s2, s3, s4 = st.columns(4)
             pnl_val = m['total_pnl']
-            pnl_delta = f"{'↑' if pnl_val > 0 else '↓'} {abs(pnl_val):.1f} pips"
-            r1c1.metric("Total Trades", m['total'])
-            r1c2.metric("Win Rate", f"{m['win_rate']}%", delta=f"{m['wins']}W / {m['losses']}L")
-            r1c3.metric("Profit Factor", m['profit_factor'])
-            r1c4.metric("Max Drawdown", f"{m['max_drawdown']} pips", delta="risk ⚠️" if m['max_drawdown'] > 20 else "ok")
-            r1c5.metric("Net P&L", f"{pnl_val:.1f} pips", delta=pnl_delta)
-            rf = m.get('recovery_factor', '∞')
-            r1c6.metric("Recovery Factor", rf)
+            pnl_color = "normal" if pnl_val >= 0 else "inverse"
+            s1.metric("Total Trades", m['total'], delta=f"{m['wins']}W / {m['losses']}L")
+            s2.metric("Win Rate", f"{m['win_rate']}%", delta=f"{m['profit_factor']} PF")
+            s3.metric("Net P&L", f"{pnl_val:.1f} pips", delta="▲" if pnl_val > 0 else "▼", delta_color=pnl_color)
+            s4.metric("Max Drawdown", f"{m['max_drawdown']} pips", delta="⚠️ risk" if m['max_drawdown'] > 20 else "ok")
 
-            # ── ROW 2: RISK & REWARD ────────────────────────────────────────────
-            st.markdown("#### 💰 Risk & Reward")
-            r2c1, r2c2, r2c3, r2c4, r2c5, r2c6 = st.columns(6)
-            r2c1.metric("Avg R:R", f"1:{m['avg_rr']}")
-            r2c2.metric("Avg Win", f"{m['avg_win']} pips", delta="per win")
-            r2c3.metric("Avg Loss", f"{m['avg_loss']} pips", delta="per loss")
-            r2c4.metric("Best Trade", f"{m.get('best', 0):.1f} pips", delta="🏆")
-            r2c5.metric("Worst Trade", f"{m.get('worst', 0):.1f} pips", delta="💔")
-            expectancy = m.get('expectancy', 0)
-            r2c6.metric("Expectancy", f"{expectancy:.2f} pips/t", delta="per trade")
+            # Row 2: Detailed metrics
+            d1, d2, d3, d4, d5, d6 = st.columns(6)
+            d1.metric("Avg R:R", f"1:{m['avg_rr']}")
+            d2.metric("Avg Win", f"{m['avg_win']} pips")
+            d3.metric("Avg Loss", f"{m['avg_loss']} pips")
+            d4.metric("Expectancy", f"{m.get('expectancy', 0):.2f} pips")
+            d5.metric("Best Trade", f"{m.get('best', 0):.1f} pips")
+            d6.metric("Worst Trade", f"{m.get('worst', 0):.1f} pips")
 
-            # ── ROW 3: DIRECTION + STREAKS ────────────────────────────────────
-            st.markdown("#### 📈 Direction & Streaks")
-            r3c1, r3c2, r3c3, r3c4, r3c5, r3c6 = st.columns(6)
-            r3c1.metric("🟢 Win Streak", f"×{m['max_win_streak']}")
-            r3c2.metric("🔴 Loss Streak", f"×{m['max_loss_streak']}")
-            r3c3.metric("BUY Win Rate", f"{m['buy_wr']}%", delta=f"{m['buy_pnl']:.1f} pips")
-            r3c4.metric("SELL Win Rate", f"{m['sell_wr']}%", delta=f"{m['sell_pnl']:.1f} pips")
-            r3c5.metric("BUY P&L", f"{m['buy_pnl']} pips")
-            r3c6.metric("SELL P&L", f"{m['sell_pnl']} pips")
-
-            # ── ROW 4: FREQUENCY ──────────────────────────────────────────────
-            st.markdown("#### ⏱️ Frequency & Duration")
-            r4c1, r4c2, r4c3, r4c4, r4c5, r4c6 = st.columns(6)
-            r4c1.metric("Trades/Hour", m['trades_per_hour'])
-            r4c2.metric("Avg Hold", f"{m['avg_hold']} cndls")
-            r4c3.metric("Avg Duration", f"{m.get('avg_duration_min', 0)} min")
-            r4c4.metric("Median Duration", f"{m.get('median_duration_min', 0)} min")
-            r4c5.metric("Total Hours", f"{m.get('total_hours', 0)} hrs")
-            sharpe = m.get('sharp_ratio_like', 0)
-            r4c6.metric("Sharpe-like", sharpe, delta="risk-adj return" if sharpe > 0.5 else "low")
+            # Row 3: Direction & streaks
+            g1, g2, g3, g4, g5 = st.columns(5)
+            g1.metric("Win Streak", f"×{m['max_win_streak']}", delta="🟢")
+            g2.metric("Loss Streak", f"×{m['max_loss_streak']}", delta="🔴")
+            g3.metric("BUY Win Rate", f"{m['buy_wr']}%", delta=f"{m['buy_pnl']:.1f}p")
+            g4.metric("SELL Win Rate", f"{m['sell_wr']}%", delta=f"{m['sell_pnl']:.1f}p")
+            g5.metric("Sharpe-like", m.get('sharp_ratio_like', 0), delta="risk-adj" if m.get('sharp_ratio_like', 0) > 0.5 else "low")
 
             # ── BEST / WORST TRADE CARDS ──────────────────────────────────────
-            st.markdown("#### 🏆 Best & 💔 Worst Trades")
             bc, wc = st.columns(2)
             best = m.get('best_trade', {})
             worst = m.get('worst_trade', {})
@@ -1471,9 +1453,9 @@ with tab2:
                     btc = "#4caf50" if best.get('result') == 'WIN' else "#f44336"
                     st.markdown(f"""
                     <div style="background:{bbg};border-left:4px solid {btc};border-radius:8px;padding:16px;margin:4px 0">
-                        <h4 style="color:{btc};margin:0">{bcd} — {best.get('pnl_pips', 0):.1f} pips</h4>
-                        <p style="color:#aaa;margin:4px 0">R:R 1:{best.get('rr', 0)} | Score {best.get('score', 0)} | Hold: {best.get('hold_candles', 0)} cndls</p>
-                        <p style="color:#888;margin:2px 0">⏰ {best.get('entry_time', '')}</p>
+                        <h4 style="color:{btc};margin:0">🏆 Best Trade — {bcd} {best.get('pnl_pips', 0):.1f} pips</h4>
+                        <p style="color:#aaa;margin:4px 0">R:R 1:{best.get('rr', 0)} | Score {best.get('score', 0)} | Hold: {best.get('hold_candles', 0)} cndls ({best.get('duration_min', 0):.1f}m)</p>
+                        <p style="color:#888;margin:2px 0">⏰ {str(best.get('entry_time', ''))[:19]} → {str(best.get('exit_time', ''))[:19]}</p>
                         <p style="color:#888;margin:2px 0">{best.get('signal', '')} @ {best.get('entry', 0):.5f} → {best.get('exit', 0):.5f}</p>
                     </div>
                     """, unsafe_allow_html=True)
@@ -1484,9 +1466,9 @@ with tab2:
                     wtc = "#4caf50" if worst.get('result') == 'WIN' else "#f44336"
                     st.markdown(f"""
                     <div style="background:{wbg};border-left:4px solid {wtc};border-radius:8px;padding:16px;margin:4px 0">
-                        <h4 style="color:{wtc};margin:0">{wcd} — {worst.get('pnl_pips', 0):.1f} pips</h4>
-                        <p style="color:#aaa;margin:4px 0">R:R 1:{worst.get('rr', 0)} | Score {worst.get('score', 0)} | Hold: {worst.get('hold_candles', 0)} cndls</p>
-                        <p style="color:#888;margin:2px 0">⏰ {worst.get('entry_time', '')}</p>
+                        <h4 style="color:{wtc};margin:0">💔 Worst Trade — {wcd} {worst.get('pnl_pips', 0):.1f} pips</h4>
+                        <p style="color:#aaa;margin:4px 0">R:R 1:{worst.get('rr', 0)} | Score {worst.get('score', 0)} | Hold: {worst.get('hold_candles', 0)} cndls ({worst.get('duration_min', 0):.1f}m)</p>
+                        <p style="color:#888;margin:2px 0">⏰ {str(worst.get('entry_time', ''))[:19]} → {str(worst.get('exit_time', ''))[:19]}</p>
                         <p style="color:#888;margin:2px 0">{worst.get('signal', '')} @ {worst.get('entry', 0):.5f} → {worst.get('exit', 0):.5f}</p>
                     </div>
                     """, unsafe_allow_html=True)
@@ -1498,16 +1480,20 @@ with tab2:
                 s_col, d_col = st.columns(2)
                 with s_col:
                     if sess_data:
-                        st.markdown("##### 🌐 Session Breakdown")
+                        st.markdown("##### 🌐 Session Breakdown (London 08-12 UTC | New York 13-17 UTC)")
+                        sess_rows = []
                         for s in sess_data:
                             icon = "🟢" if s['pnl'] > 0 else "🔴" if s['pnl'] < 0 else "⚪"
-                            st.markdown(f"**{icon} {s['session']}** — {s['pnl']:.1f} pips | {s['count']} trades | avg {s['avg_pnl']:.1f}p")
+                            sess_rows.append({"Session": f"{icon} {s['session']}", "Trades": s['count'], "P&L (pips)": round(s['pnl'], 1), "Avg (pips)": round(s['avg_pnl'], 1)})
+                        st.dataframe(pd.DataFrame(sess_rows), hide_index=True, use_container_width=True)
                 with d_col:
                     if dur_data:
                         st.markdown("##### ⏱️ Duration Breakdown")
+                        dur_rows = []
                         for d in dur_data:
                             icon = "🟢" if d['pnl'] > 0 else "🔴" if d['pnl'] < 0 else "⚪"
-                            st.markdown(f"**{icon} {d['duration']}** — {d['pnl']:.1f} pips | {d['count']} trades | avg {d['avg_pnl']:.1f}p")
+                            dur_rows.append({"Duration": f"{icon} {d['duration']}", "Trades": d['count'], "P&L (pips)": round(d['pnl'], 1), "Avg (pips)": round(d['avg_pnl'], 1)})
+                        st.dataframe(pd.DataFrame(dur_rows), hide_index=True, use_container_width=True)
 
             # ── EQUITY CURVE + DRAWDOWN ────────────────────────────────────────
             st.markdown("---")
@@ -1545,54 +1531,6 @@ with tab2:
                         config={'scrollZoom': False, 'displayModeBar': True,
                             'modeBarButtonsToRemove': ['lasso2d', 'select2d', 'autoScale2d', 'hoverCompareCartesian'],
                             'doubleClick': False, 'editable': False})
-
-            # ── MONTHLY RETURNS ─────────────────────────────────────────────────
-            st.markdown("#### 📅 Monthly Returns Heatmap")
-            mh = monthly_heatmap(m)
-            if mh:
-                st.plotly_chart(mh, use_container_width=True,
-                    config={'scrollZoom': False, 'displayModeBar': True,
-                        'modeBarButtonsToRemove': ['lasso2d', 'select2d', 'autoScale2d', 'hoverCompareCartesian'],
-                        'doubleClick': False, 'editable': False})
-
-            # ── WIN RATE GAUGE ──────────────────────────────────────────────────
-            st.markdown("#### 🎯 Win Rate & Trade Direction")
-            gauge_col, dir_col = st.columns(2)
-            with gauge_col:
-                fig_gauge = go.Figure(go.Indicator(
-                    mode="gauge+number+delta",
-                    value=m['win_rate'],
-                    domain={'x': [0, 1], 'y': [0, 1]},
-                    gauge={
-                        'axis': {'range': [0, 100], 'tickcolor': '#333'},
-                        'bar': {'color': '#26a69a'},
-                        'bgcolor': '#1a1a2e',
-                        'borderwidth': 2, 'bordercolor': '#444',
-                        'steps': [
-                            {'range': [0, 40], 'color': '#ef5350'},
-                            {'range': [40, 60], 'color': '#ffca28'},
-                            {'range': [60, 100], 'color': '#26a69a'},
-                        ],
-                    },
-                    title={'text': f"Win Rate % | {m['wins']}W / {m['losses']}L"},
-                    number={'suffix': '%', 'font': {'color': '#26a69a', 'size': 28}},
-                    delta={'reference': 55, 'suffix': '%', 'position': "bottom"},
-                ))
-                fig_gauge.update_layout(template='plotly_dark', height=220, margin=dict(l=20, r=20, t=40, b=20))
-                st.plotly_chart(fig_gauge, use_container_width=True,
-                    config={'scrollZoom': False, 'displayModeBar': False, 'doubleClick': False, 'editable': False})
-            with dir_col:
-                fig_dir = go.Figure()
-                buy_pnl = m.get('buy_pnl', 0)
-                sell_pnl = m.get('sell_pnl', 0)
-                fig_dir.add_trace(go.Bar(x=['BUY 🟢', 'SELL 🔴'], y=[buy_pnl, sell_pnl],
-                    marker_color=['#26a69a', '#ef5350'], text=[f"{buy_pnl:.1f}p", f"{sell_pnl:.1f}p"],
-                    textposition='outside', textfont={'color': '#fff'}))
-                fig_dir.update_layout(template='plotly_dark', height=220, title="P&L by Direction",
-                    yaxis_title="P&L (pips)", margin=dict(l=20, r=20, t=40, b=40),
-                    hovermode='x unified')
-                st.plotly_chart(fig_dir, use_container_width=True,
-                    config={'scrollZoom': False, 'displayModeBar': False, 'doubleClick': False, 'editable': False})
 
             # ── PRICE CHART WITH TRADE MARKERS ─────────────────────────────────
             st.markdown("#### 📊 Price Chart with Trade Markers")
@@ -1668,33 +1606,6 @@ with tab2:
                 },
                 hide_index=True, use_container_width=True, height=450
             )
-
-            # ── TRADE STATS SUMMARY TABLE ──────────────────────────────────────
-            st.markdown("##### 📐 Trade Statistics Summary")
-            stats_rows = []
-            for _, t in td.iterrows():
-                stats_rows.append({
-                    "Trade #": _,
-                    "Direction": t['signal'],
-                    "Entry Time": str(t['entry_time'])[:19],
-                    "Exit Time": str(t['exit_time'])[:19],
-                    "Entry Price": round(t['entry'], 5),
-                    "Exit Price": round(t['exit'], 5),
-                    "SL Price": round(t['sl'], 5),
-                    "TP Price": round(t['tp'], 5),
-                    "R:R": round(t['rr'], 2),
-                    "Score": t['score'],
-                    "Result": t['result'],
-                    "P&L (pips)": round(t['pnl_pips'], 1),
-                    "SL (pips)": round(t['sl_pips'], 1),
-                    "TP (pips)": round(t['tp_pips'], 1),
-                    "Hold (candles)": t['hold_candles'],
-                    "Duration (min)": round(t['duration_min'], 1),
-                    "Session": t.get('session', 'Other'),
-                    "Hour": t.get('hour', 0),
-                })
-            stats_df = pd.DataFrame(stats_rows)
-            st.dataframe(stats_df, hide_index=True, use_container_width=True, height=300)
 
             # ── DOWNLOAD BUTTONS ───────────────────────────────────────────────
             dl1, dl2 = st.columns(2)
@@ -1849,20 +1760,22 @@ with tab3:
 
         # ── RECENT SIGNALS HISTORY ──────────────────────────────────────────
         st.markdown("---")
-        st.markdown("#### 📜 Recent Signals History (Last 3 per Pair)")
+        st.markdown("#### 📜 Latest 3 Completed Signals (All Pairs / Strategies / TFs)")
 
-        # Fetch recent signals across all pairs + all strategies in parallel
+        # Fetch recent signals across all pairs + all strategies + all timeframes in parallel
         def fetch_historical_signals():
             hist = []
             scan_pairs = ac.get('pairs', ALL_PAIRS)
-            with ThreadPoolExecutor(max_workers=min(len(scan_pairs) * len(STRATEGIES), 16)) as ex:
+            timeframes = ["M1", "M5", "H1"]
+            with ThreadPoolExecutor(max_workers=min(len(scan_pairs) * len(STRATEGIES) * len(timeframes), 32)) as ex:
                 futures = {}
                 for pair in scan_pairs:
                     for strat in STRATEGIES.keys():
                         p = STRATEGIES[strat]["params"].copy()
                         p.update({k: v for k, v in params.items() if k in p})
-                        f = ex.submit(scan_pair_historical, pair, st.session_state.get("active_tf", "M1"), strat, p, 3)
-                        futures[f] = (pair, strat)
+                        for tf in timeframes:
+                            f = ex.submit(scan_pair_historical, pair, tf, strat, p, 3)
+                            futures[f] = (pair, strat, tf)
                 for f in as_completed(futures):
                     try:
                         results = f.result()
@@ -1875,23 +1788,24 @@ with tab3:
             hist_signals = fetch_historical_signals()
 
         if hist_signals:
-            # Sort by exit time descending (most recent first)
+            # Sort by exit time descending, keep only the 3 latest
             hist_signals.sort(key=lambda x: pd.to_datetime(x['exit_time']), reverse=True)
+            latest_3 = hist_signals[:3]
 
-            # Metrics row
-            h_wins = [s for s in hist_signals if s['result'] == 'WIN']
-            h_losses = [s for s in hist_signals if s['result'] == 'LOSS']
-            h_total_pnl = sum(s['pnl_pips'] for s in hist_signals)
+            # Summary metrics
+            h_wins = [s for s in latest_3 if s['result'] == 'WIN']
+            h_losses = [s for s in latest_3 if s['result'] == 'LOSS']
+            h_total_pnl = sum(s['pnl_pips'] for s in latest_3)
             hr1, hr2, hr3, hr4 = st.columns(4)
-            hr1.metric("📜 Total Past Trades", len(hist_signals))
+            hr1.metric("Latest Signals", len(latest_3))
             hr2.metric("🟢 Wins", len(h_wins))
             hr3.metric("🔴 Losses", len(h_losses))
             pnl_icon = "🟢" if h_total_pnl > 0 else "🔴"
             hr4.metric("💰 Net P&L", f"{pnl_icon} {h_total_pnl:.1f} pips")
 
-            # Build table
+            # Build and display compact table — only essential columns
             rows = []
-            for s in hist_signals:
+            for s in latest_3:
                 is_buy = s.get('signal', s.get('direction', '')) == 'BUY'
                 rows.append({
                     'Pair': s['symbol'],
@@ -1900,19 +1814,13 @@ with tab3:
                     'Dir': "🟢 BUY" if is_buy else "🔴 SELL",
                     'Entry': f"{s['entry']:.5f}",
                     'Exit': f"{s['exit']:.5f}",
-                    'SL': f"{s['sl']:.5f}",
-                    'TP': f"{s['tp']:.5f}",
-                    'R:R': f"1:{s['rr']:.2f}",
+                    'R:R': f"1:{s['rr']:.1f}",
                     'Score': s['score'],
                     'Result': "🟢 WIN" if s['result'] == 'WIN' else "🔴 LOSS",
-                    'P&L': f"{s['pnl_pips']:.1f}p",
-                    'Hold': f"{s.get('hold_candles', 0)}c",
-                    'Duration': f"{s.get('duration_min', 0):.1f}m",
-                    'Entry @': str(s.get('entry_time', ''))[:16],
+                    'P&L': f"{s['pnl_pips']:+.1f}p",
                     'Exit @': str(s.get('exit_time', ''))[:16],
                 })
             tbl = pd.DataFrame(rows)
-
             st.dataframe(
                 tbl.style.map(
                     lambda _: "background-color:#0d2e12;color:#4caf50;font-weight:bold",
@@ -1934,26 +1842,14 @@ with tab3:
                     "Dir": st.column_config.TextColumn("Direction", width="small"),
                     "Entry": st.column_config.TextColumn("Entry", width="medium"),
                     "Exit": st.column_config.TextColumn("Exit", width="medium"),
-                    "SL": st.column_config.TextColumn("SL", width="medium"),
-                    "TP": st.column_config.TextColumn("TP", width="medium"),
                     "R:R": st.column_config.TextColumn("R:R", width="small"),
                     "Score": st.column_config.NumberColumn("Score", format="%d", width="small"),
                     "Result": st.column_config.TextColumn("Result", width="small"),
                     "P&L": st.column_config.TextColumn("P&L", width="small"),
-                    "Hold": st.column_config.TextColumn("Hold", width="small"),
-                    "Duration": st.column_config.TextColumn("Duration", width="small"),
-                    "Entry @": st.column_config.TextColumn("Entry @", width="medium"),
-                    "Exit @": st.column_config.TextColumn("Exit @", width="medium"),
+                    "Exit @": st.column_config.TextColumn("Closed @", width="medium"),
                 },
-                hide_index=True, use_container_width=True, height=350
+                hide_index=True, use_container_width=True, height=180
             )
-
-            # Download historical signals CSV
-            hist_df = pd.DataFrame(hist_signals)
-            hist_csv = hist_df.to_csv(index=False).encode('utf-8')
-            st.download_button("📥 Download History CSV", hist_csv,
-                f"signals_history_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", "text/csv",
-                use_container_width=True)
         else:
             st.info("📭 No recent signals found in the lookback period. Try enabling more pairs or lowering thresholds.")
 
