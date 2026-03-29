@@ -1693,18 +1693,25 @@ with tab3:
             ac['pairs'] = selected_scan_pairs
         with set_row2[1]:
             scan_tf = st.selectbox("⏱️ Timeframe", ["M1", "M5", "H1"], index=["M1", "M5", "H1"].index(st.session_state.get("active_tf", "M1")), key="scan_tf")
+        dup_col, _ = st.columns([1, 2])
+        with dup_col:
+            dup_candles = st.number_input("🔁 Dup Candles (cooldown)", 1, 30, 5, key="dup_candles")
         st.session_state.alert_config = ac
 
+    # Init signal log if not present
+    if "signal_log" not in st.session_state:
+        st.session_state.signal_log = []
+
     # Active settings bar
-    strat_label = active if scan_mode == "Active Strategy" else "All Strategies"
+    strat_label = active if scan_mode == "Active Strategy" else "All Strategies (×6)"
     st.info(
         f"⏱️ Auto 10s | 📡 {strat_label} | TF: {scan_tf} | "
         f"Score≥{ac['min_score']} | R:R≥{ac['min_rr']} | "
         f"Pairs: {', '.join(ac.get('pairs', [])[:4])}{'...' if len(ac.get('pairs', [])) > 4 else ''}"
     )
 
-    # ── SCAN ALL STRATEGIES ACROSS PAIRS ───────────────────────────────────
-    refresh_count = st_autorefresh(interval=10000, key="scanner_v6")
+    # ── AUTO-REFRESH ───────────────────────────────────────────────────────
+    refresh_count = st_autorefresh(interval=10000, key="scanner_v7")
     st.session_state.refresh_count = refresh_count
 
     # Decrement cooldown
@@ -1716,11 +1723,33 @@ with tab3:
         p.update({k: v for k, v in params.items() if k in p})
         return p
 
+    def is_duplicate(sig, log, lookback=20):
+        """Return True if same pair+direction+strategy+TF already in last `lookback` signals."""
+        for prev in log[-lookback:]:
+            if (prev['symbol'] == sig['symbol']
+                    and prev['signal'] == sig['signal']
+                    and prev.get('strategy') == sig.get('strategy')
+                    and prev.get('timeframe') == sig.get('timeframe')):
+                return True
+        return False
+
+    def format_sig_time(t):
+        """Format datetime or string to consistent HH:MM:SS string."""
+        try:
+            return pd.to_datetime(t).strftime('%H:%M:%S')
+        except Exception:
+            return str(t)[:8]
+
+    # ── SCAN ──────────────────────────────────────────────────────────────
+    fresh_signals = []
+
     if scan_mode == "Active Strategy":
         live_signals = scan_all_pairs(active, params)
+        for s in live_signals:
+            if not is_duplicate(s, st.session_state.signal_log):
+                fresh_signals.append(s)
     else:
-        # Scan all strategies across selected pairs in parallel
-        live_signals = []
+        # Scan all strategies × all pairs (single TF selected) in parallel
         pairs_to_scan = ac.get('pairs', ALL_PAIRS)
         with ThreadPoolExecutor(max_workers=min(len(pairs_to_scan) * len(STRATEGIES), 32)) as ex:
             futures = {
@@ -1732,15 +1761,15 @@ with tab3:
                 try:
                     s = f.result()
                     if s and s['score'] >= ac['min_score'] and s['rr'] >= ac['min_rr']:
-                        live_signals.append(s)
+                        fresh_signals.append(s)
                 except Exception:
                     pass
 
-    # Sort by score descending
-    if live_signals:
-        live_signals.sort(key=lambda x: x['score'], reverse=True)
-        sig_ids = [id(s) for s in live_signals]
-        new_sigs = [s for s in live_signals if id(s) not in st.session_state.last_signal_hashes]
+    # Sort newest-first by timestamp
+    if fresh_signals:
+        fresh_signals.sort(key=lambda x: str(x.get('time', '')), reverse=True)
+        sig_ids = [id(s) for s in fresh_signals]
+        new_sigs = [s for s in fresh_signals if id(s) not in st.session_state.last_signal_hashes]
 
         if new_sigs and ac.get('sound_enabled'):
             st.markdown(SOUND_JS, unsafe_allow_html=True)
@@ -1751,66 +1780,96 @@ with tab3:
         st.session_state.last_signal_hashes = sig_ids
 
     # Update cooldowns
-    for s in live_signals:
+    for s in fresh_signals:
         st.session_state.pair_cooldown[s['symbol']] = params.get('cooldown', 0)
 
-    # ── LIVE ALERTS CARDS ─────────────────────────────────────────────────
-    st.markdown("#### 🚨 Live Alerts")
-    if live_signals:
-        # Summary row
-        total = len(live_signals)
-        strong = [s for s in live_signals if s['score'] >= 75]
-        avg_rr = sum(s['rr'] for s in live_signals) / total if total else 0
-        buy_ct = sum(1 for s in live_signals if s['signal'] == 'BUY')
-        sell_ct = sum(1 for s in live_signals if s['signal'] == 'SELL')
-        met1, met2, met3, met4 = st.columns(4)
-        met1.metric("Total Alerts", total, delta=f"{len(strong)} strong")
-        met2.metric("🟢 BUY", buy_ct)
-        met3.metric("🔴 SELL", sell_ct)
-        met4.metric("Avg R:R", f"1:{avg_rr:.2f}")
+    # ── LOG NEW SIGNALS ────────────────────────────────────────────────────
+    for s in fresh_signals:
+        sig_entry = {
+            'symbol': s['symbol'],
+            'strategy': s.get('strategy', active),
+            'timeframe': s.get('timeframe', scan_tf),
+            'direction': s['signal'],
+            'score': s['score'],
+            'rr': s['rr'],
+            'entry': s['entry'],
+            'sl': s['sl'],
+            'tp': s['tp'],
+            'rsi': s.get('rsi'),
+            'atr': s.get('atr'),
+            'timestamp': format_sig_time(s.get('time', datetime.now())),
+            'logged_at': datetime.now().strftime('%H:%M:%S'),
+        }
+        st.session_state.signal_log.append(sig_entry)
 
-        # Signal cards in a 2-col grid
-        card_cols = st.columns(2)
-        for idx, sig in enumerate(live_signals):
-            with card_cols[idx % 2]:
-                st.markdown(signal_card(sig), unsafe_allow_html=True)
+    # Keep log bounded
+    st.session_state.signal_log = st.session_state.signal_log[-200:]
+
+    # ── LATEST 5 SIGNALS ───────────────────────────────────────────────────
+    st.markdown("#### 📜 Latest 5 Signals")
+
+    log = st.session_state.signal_log
+    latest_5 = list(reversed(log))[:5]  # newest at top
+
+    if latest_5:
+        # Quick stats
+        buy_c = sum(1 for x in latest_5 if x['direction'] == 'BUY')
+        sell_c = sum(1 for x in latest_5 if x['direction'] == 'SELL')
+        sk1, sk2, sk3, sk4 = st.columns(4)
+        sk1.metric("Logged", len(latest_5))
+        sk2.metric("🟢 BUY", buy_c)
+        sk3.metric("🔴 SELL", sell_c)
+        avg_rr = sum(x['rr'] for x in latest_5) / len(latest_5) if latest_5 else 0
+        sk4.metric("Avg R:R", f"1:{avg_rr:.2f}")
+
+        # Styled cards — newest first
+        for sig in latest_5:
+            is_buy = sig['direction'] == 'BUY'
+            border = '#4caf50' if is_buy else '#f44336'
+            bg = '#0d2e12' if is_buy else '#2e0d0d'
+            dir_icon = "🟢 BUY" if is_buy else "🔴 SELL"
+            st.markdown(f"""
+            <div style="background:{bg};border-left:4px solid {border};border-radius:8px;padding:12px;margin:6px 0">
+                <div style="display:flex;justify-content:space-between;align-items:center">
+                    <div>
+                        <span style="font-size:17px;font-weight:bold;color:{border}">{sig['symbol']}</span>
+                        <span style="color:#888;margin-left:10px;font-size:13px">{sig['strategy']}</span>
+                        <span style="color:#666;margin-left:8px;font-size:13px">| {sig['timeframe']}</span>
+                    </div>
+                    <div style="text-align:right">
+                        <div style="font-size:15px;font-weight:bold;color:{border}">{dir_icon}</div>
+                        <div style="color:#aaa;font-size:12px">S:{sig['score']} | R:R 1:{sig['rr']}</div>
+                    </div>
+                </div>
+                <div style="color:#bbb;font-size:13px;margin-top:6px">
+                    Entry <span style="color:#fff">{sig['entry']:.5f}</span>
+                    | SL <span style="color:#f44336">{sig['sl']:.5f}</span>
+                    | TP <span style="color:#4caf50">{sig['tp']:.5f}</span>
+                    <span style="color:#555;margin-left:8px">@ {sig['logged_at']}</span>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
     else:
-        st.warning("⚠️ **No signals found.** Try lowering min_score, min R:R, or enabling more pairs.")
+        st.info("📡 No signals logged yet. Signals will appear here as they are found on closed candles.")
 
-    # ── FULL SIGNAL TABLE ──────────────────────────────────────────────────
-    if live_signals:
-        st.markdown("#### 📋 All Signals (Filtered)")
-        filt_pair, filt_dir = st.columns([1, 1])
-        with filt_pair:
-            filt_p = st.selectbox("🔍 Filter by Pair", ["All"] + ac.get('pairs', ALL_PAIRS), key="filt_pair")
-        with filt_dir:
-            filt_d = st.selectbox("🔍 Filter by Direction", ["All", "BUY", "SELL"], key="filt_dir")
-
-        filtered = [
-            s for s in live_signals
-            if (filt_p == "All" or s['symbol'] == filt_p)
-            and (filt_d == "All" or s['signal'] == filt_d)
-        ]
-
-        tbl_rows = []
-        for s in filtered:
-            tbl_rows.append({
-                'Pair': s['symbol'],
-                'Strategy': s.get('strategy', active),
-                'TF': s.get('timeframe', scan_tf),
-                'Dir': s['signal'],
-                'Entry': f"{s['entry']:.5f}",
-                'SL': f"{s['sl']:.5f}",
-                'TP': f"{s['tp']:.5f}",
-                'R:R': f"1:{s['rr']}",
-                'Score': s['score'],
-                'RSI': s['rsi'],
-                'ATR': s['atr'],
-                'Time': str(s['time'])[:19],
-            })
-        tbl = pd.DataFrame(tbl_rows)
+    # ── SIGNAL LOG TABLE ─────────────────────────────────────────────────
+    if log:
+        st.markdown("#### 📋 Signal Log")
+        log_rows = [{
+            'Pair': s['symbol'],
+            'Strategy': s['strategy'],
+            'TF': s['timeframe'],
+            'Dir': s['direction'],
+            'Entry': f"{s['entry']:.5f}",
+            'SL': f"{s['sl']:.5f}",
+            'TP': f"{s['tp']:.5f}",
+            'R:R': f"1:{s['rr']}",
+            'Score': s['score'],
+            'Time': s['logged_at'],
+        } for s in reversed(log)]
+        log_tbl = pd.DataFrame(log_rows)
         st.dataframe(
-            tbl.style.apply(
+            log_tbl.style.apply(
                 lambda r: ['background-color:#0d2e12;color:#4caf50']*len(r) if r['Dir']=='BUY'
                 else ['background-color:#2e0d0d;color:#f44336']*len(r)
                 for _ in r
@@ -1825,17 +1884,44 @@ with tab3:
                 "TP": st.column_config.TextColumn("TP", width="medium"),
                 "R:R": st.column_config.TextColumn("R:R", width="small"),
                 "Score": st.column_config.NumberColumn("Score", format="%d", width="small"),
-                "RSI": st.column_config.NumberColumn("RSI", format="%.1f", width="small"),
-                "ATR": st.column_config.NumberColumn("ATR", format="%.5f", width="small"),
-                "Time": st.column_config.TextColumn("Time", width="medium"),
+                "Time": st.column_config.TextColumn("Logged @", width="small"),
             },
-            hide_index=True, use_container_width=True, height=300
+            hide_index=True, use_container_width=True, height=250
         )
 
-        # MT5 export
-        mt5_bytes = mt5_signal_file(ac.get('pairs', [ALL_PAIRS[0]])[0], live_signals)
+        # Download log
+        log_csv = pd.DataFrame(log_rows).to_csv(index=False).encode('utf-8')
         st.download_button(
-            "🤖 Export MT5 Signals (JSON)",
+            "📥 Download Signal Log CSV",
+            log_csv,
+            f"signal_log_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+            "text/csv",
+        )
+
+    # ── MT5 EXPORT (latest 5 only) ────────────────────────────────────────
+    if latest_5:
+        mt5_rows = [
+            {
+                "action": "OPEN",
+                "symbol": s['symbol'],
+                "type": s['direction'],
+                "entry": s['entry'],
+                "stop_loss": s['sl'],
+                "take_profit": s['tp'],
+                "sl_pips": round(abs(s['entry'] - s['sl']) / get_pip_value(s['symbol']), 1),
+                "tp_pips": round(abs(s['tp'] - s['entry']) / get_pip_value(s['symbol']), 1),
+                "risk": "MEDIUM",
+                "score": s['score'],
+                "strategy": s['strategy'],
+                "timeframe": s['timeframe'],
+                "timestamp": s['logged_at'],
+                "magic": 2024,
+            }
+            for s in latest_5
+        ]
+        mt5_bytes = json.dumps(mt5_rows, indent=2).encode('utf-8')
+        st.download_button(
+            "🤖 Export Latest 5 to MT5 (JSON)",
             mt5_bytes,
             f"mt5_signals_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
             "application/json",
@@ -1872,7 +1958,6 @@ with tab3:
         hist_signals.sort(key=lambda x: pd.to_datetime(x['exit_time']), reverse=True)
         latest_3 = hist_signals[:3]
 
-        # Summary metrics
         h_wins = [s for s in latest_3 if s['result'] == 'WIN']
         h_losses = [s for s in latest_3 if s['result'] == 'LOSS']
         h_total_pnl = sum(s['pnl_pips'] for s in latest_3)
@@ -1883,7 +1968,6 @@ with tab3:
         pnl_icon = "🟢" if h_total_pnl > 0 else "🔴"
         hr4.metric("💰 Net P&L", f"{pnl_icon} {h_total_pnl:.1f} pips")
 
-        # Display each as a styled card
         for s in latest_3:
             is_buy = s.get('signal', s.get('direction', '')) == 'BUY'
             is_win = s['result'] == 'WIN'
