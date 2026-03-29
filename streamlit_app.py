@@ -515,6 +515,84 @@ def scan_pair(symbol: str, interval: str, strategy: str, params: dict) -> dict |
         }
     return None
 
+def scan_pair_historical(symbol: str, interval: str, strategy: str, params: dict, max_trades: int = 3) -> list:
+    """Scan recent candles and return the last N completed signals (non-overlapping)."""
+    tf_int = TF_INTERVAL.get(interval, "1m")
+    tf_rng = TF_PERIOD.get(interval, "5d")
+    df = get_candles(symbol, tf_int, tf_rng, count=300)
+    if df.empty or len(df) < 50:
+        return []
+    df = add_indicators(df, params)
+    df = df.reset_index(drop=True)
+
+    signals_found = []
+    position = None
+    lookback = max(50, params.get('ema_trend_slow', 50))
+
+    # Scan from lookback to near the end (don't use last 2 bars — they may be incomplete)
+    for i in range(lookback, len(df) - 2):
+        direction = find_signal(df, i, strategy, params)
+        if direction and position is None:
+            score = score_signal(df, i, direction, params)
+            if score >= params['min_score']:
+                entry = df.iloc[i]['close']
+                sl = calc_sl(direction, entry, df, i, params)
+                tp = calc_tp(direction, entry, sl, df, i, params, symbol)
+                position = direction
+                pos_entry, pos_sl, pos_tp = entry, sl, tp
+                pos_score, pos_time = score, df.iloc[i]['time']
+                pos_idx = i
+            continue
+
+        if position:
+            close = df.iloc[i]['close']
+            exit_p, result = None, None
+            if position == 'BUY':
+                if close <= pos_sl:
+                    exit_p, result = pos_sl, 'LOSS'
+                elif close >= pos_tp:
+                    exit_p, result = pos_tp, 'WIN'
+            else:
+                if close >= pos_sl:
+                    exit_p, result = pos_sl, 'LOSS'
+                elif close <= pos_tp:
+                    exit_p, result = pos_tp, 'WIN'
+            if result:
+                risk = abs(pos_entry - pos_sl)
+                reward = abs(exit_p - pos_entry)
+                rr = round(reward / risk, 2) if risk > 0 else 0
+                pip_val = get_pip_value(symbol)
+                signals_found.append({
+                    'symbol': symbol,
+                    'signal': position,
+                    'direction': position,
+                    'entry': round(pos_entry, 5),
+                    'exit': round(exit_p, 5),
+                    'sl': round(pos_sl, 5),
+                    'tp': round(pos_tp, 5),
+                    'rr': rr,
+                    'score': pos_score,
+                    'result': result,
+                    'pnl_pips': round((reward / pip_val) if result == 'WIN' else -(risk / pip_val), 1),
+                    'entry_time': pos_time,
+                    'exit_time': df.iloc[i]['time'],
+                    'entry_idx': pos_idx,
+                    'exit_idx': i,
+                    'timeframe': interval,
+                    'strategy': strategy,
+                    'rsi': round(df.iloc[pos_idx]['rsi'], 1),
+                    'atr': round(df.iloc[pos_idx]['atr'], 5),
+                    'hold_candles': i - pos_idx,
+                    'duration_min': round((df.iloc[i]['time'] - pos_time).total_seconds() / 60, 1),
+                })
+                position = None
+                if len(signals_found) >= max_trades:
+                    break
+
+    # Return in chronological order (oldest first)
+    return list(reversed(signals_found))
+
+
 def scan_all_pairs(strategy, params) -> list:
     pairs = st.session_state.selected_pairs
     interval = st.session_state.get("active_tf", "M1")
@@ -1768,6 +1846,117 @@ with tab3:
                 f"mt5_signals_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
                 "application/json",
             )
+
+        # ── RECENT SIGNALS HISTORY ──────────────────────────────────────────
+        st.markdown("---")
+        st.markdown("#### 📜 Recent Signals History (Last 3 per Pair)")
+
+        # Fetch recent signals across all pairs + all strategies in parallel
+        def fetch_historical_signals():
+            hist = []
+            scan_pairs = ac.get('pairs', ALL_PAIRS)
+            with ThreadPoolExecutor(max_workers=min(len(scan_pairs) * len(STRATEGIES), 16)) as ex:
+                futures = {}
+                for pair in scan_pairs:
+                    for strat in STRATEGIES.keys():
+                        p = STRATEGIES[strat]["params"].copy()
+                        p.update({k: v for k, v in params.items() if k in p})
+                        f = ex.submit(scan_pair_historical, pair, st.session_state.get("active_tf", "M1"), strat, p, 3)
+                        futures[f] = (pair, strat)
+                for f in as_completed(futures):
+                    try:
+                        results = f.result()
+                        hist.extend(results)
+                    except Exception:
+                        pass
+            return hist
+
+        with st.spinner("📜 Fetching recent signals history..."):
+            hist_signals = fetch_historical_signals()
+
+        if hist_signals:
+            # Sort by exit time descending (most recent first)
+            hist_signals.sort(key=lambda x: pd.to_datetime(x['exit_time']), reverse=True)
+
+            # Metrics row
+            h_wins = [s for s in hist_signals if s['result'] == 'WIN']
+            h_losses = [s for s in hist_signals if s['result'] == 'LOSS']
+            h_total_pnl = sum(s['pnl_pips'] for s in hist_signals)
+            hr1, hr2, hr3, hr4 = st.columns(4)
+            hr1.metric("📜 Total Past Trades", len(hist_signals))
+            hr2.metric("🟢 Wins", len(h_wins))
+            hr3.metric("🔴 Losses", len(h_losses))
+            pnl_icon = "🟢" if h_total_pnl > 0 else "🔴"
+            hr4.metric("💰 Net P&L", f"{pnl_icon} {h_total_pnl:.1f} pips")
+
+            # Build table
+            rows = []
+            for s in hist_signals:
+                is_buy = s.get('signal', s.get('direction', '')) == 'BUY'
+                rows.append({
+                    'Pair': s['symbol'],
+                    'Strategy': s.get('strategy', active),
+                    'TF': s.get('timeframe', 'M1'),
+                    'Dir': "🟢 BUY" if is_buy else "🔴 SELL",
+                    'Entry': f"{s['entry']:.5f}",
+                    'Exit': f"{s['exit']:.5f}",
+                    'SL': f"{s['sl']:.5f}",
+                    'TP': f"{s['tp']:.5f}",
+                    'R:R': f"1:{s['rr']:.2f}",
+                    'Score': s['score'],
+                    'Result': "🟢 WIN" if s['result'] == 'WIN' else "🔴 LOSS",
+                    'P&L': f"{s['pnl_pips']:.1f}p",
+                    'Hold': f"{s.get('hold_candles', 0)}c",
+                    'Duration': f"{s.get('duration_min', 0):.1f}m",
+                    'Entry @': str(s.get('entry_time', ''))[:16],
+                    'Exit @': str(s.get('exit_time', ''))[:16],
+                })
+            tbl = pd.DataFrame(rows)
+
+            st.dataframe(
+                tbl.style.map(
+                    lambda _: "background-color:#0d2e12;color:#4caf50;font-weight:bold",
+                    subset=pd.IndexSlice[tbl[tbl['Result'] == '🟢 WIN'].index, ['Result', 'P&L']]
+                ).map(
+                    lambda _: "background-color:#2e0d0d;color:#f44336;font-weight:bold",
+                    subset=pd.IndexSlice[tbl[tbl['Result'] == '🔴 LOSS'].index, ['Result', 'P&L']]
+                ).map(
+                    lambda _: "color:#4caf50;font-weight:bold",
+                    subset=pd.IndexSlice[tbl[tbl['Dir'] == '🟢 BUY'].index, ['Dir']]
+                ).map(
+                    lambda _: "color:#f44336;font-weight:bold",
+                    subset=pd.IndexSlice[tbl[tbl['Dir'] == '🔴 SELL'].index, ['Dir']]
+                ),
+                column_config={
+                    "Pair": st.column_config.TextColumn("Pair", width="small"),
+                    "Strategy": st.column_config.TextColumn("Strategy", width="medium"),
+                    "TF": st.column_config.TextColumn("TF", width="small"),
+                    "Dir": st.column_config.TextColumn("Direction", width="small"),
+                    "Entry": st.column_config.TextColumn("Entry", width="medium"),
+                    "Exit": st.column_config.TextColumn("Exit", width="medium"),
+                    "SL": st.column_config.TextColumn("SL", width="medium"),
+                    "TP": st.column_config.TextColumn("TP", width="medium"),
+                    "R:R": st.column_config.TextColumn("R:R", width="small"),
+                    "Score": st.column_config.NumberColumn("Score", format="%d", width="small"),
+                    "Result": st.column_config.TextColumn("Result", width="small"),
+                    "P&L": st.column_config.TextColumn("P&L", width="small"),
+                    "Hold": st.column_config.TextColumn("Hold", width="small"),
+                    "Duration": st.column_config.TextColumn("Duration", width="small"),
+                    "Entry @": st.column_config.TextColumn("Entry @", width="medium"),
+                    "Exit @": st.column_config.TextColumn("Exit @", width="medium"),
+                },
+                hide_index=True, use_container_width=True, height=350
+            )
+
+            # Download historical signals CSV
+            hist_df = pd.DataFrame(hist_signals)
+            hist_csv = hist_df.to_csv(index=False).encode('utf-8')
+            st.download_button("📥 Download History CSV", hist_csv,
+                f"signals_history_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", "text/csv",
+                use_container_width=True)
+        else:
+            st.info("📭 No recent signals found in the lookback period. Try enabling more pairs or lowering thresholds.")
+
     else:
         st.warning(
             "⚠️ **No signals.**\n\n"
