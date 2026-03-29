@@ -1667,6 +1667,11 @@ with tab2:
 with tab3:
     st.header("🔴 Multi-Pair Scanner")
 
+    # ── STRATEGY PARAMS: read from sidebar (same as tab1 uses) ─────────────
+    active = st.session_state.get("active_strategy", DEFAULT_STRATEGY)
+    params = st.session_state.get("active_params", STRATEGIES[active]["params"].copy())
+    scan_tf = st.session_state.get("active_tf", "M1")
+
     # ── SESSION STATE INIT ────────────────────────────────────────────────
     if "signal_log" not in st.session_state:
         st.session_state.signal_log = []
@@ -1740,22 +1745,18 @@ with tab3:
         f"{'⏸️ PAUSED' if st.session_state.scan_paused else '▶️ LIVE'} | "
         f"📡 {mode_label} | {scan_tf} | "
         f"Score≥{ac['min_score']} | R:R≥{ac['min_rr']} | "
-        f"Pairs: {', '.join(ac.get('pairs', [])[:4])}{'...' if len(ac.get('pairs',[])) > 4 else ''}"
+        f"Pairs: {', '.join(st.session_state.selected_pairs[:4])}{'...' if len(st.session_state.selected_pairs) > 4 else ''}"
     )
 
     # ── BACKGROUND SCAN: runs BEFORE display, updates signal_log ─────────
     # This is the scan heartbeat — all logic here executes top-to-bottom each rerun
     if not st.session_state.scan_paused:
-        # Decrement cooldown
-        for k in list(st.session_state.pair_cooldown.keys()):
-            st.session_state.pair_cooldown[k] = max(0, st.session_state.pair_cooldown[k] - 1)
-
         fresh_signals = []
         if scan_mode_local == "Active Strategy":
             raw = scan_all_pairs(active, params)
             fresh_signals = raw if raw else []
         else:
-            pairs_to_scan = ac.get('pairs', ALL_PAIRS)
+            pairs_to_scan = st.session_state.selected_pairs or ALL_PAIRS
             with ThreadPoolExecutor(max_workers=min(len(pairs_to_scan) * len(STRATEGIES), 32)) as ex:
                 futures = {
                     ex.submit(scan_pair, pair, scan_tf, strat, build_scan_params(strat)): (pair, strat)
@@ -1769,6 +1770,14 @@ with tab3:
                             fresh_signals.append(s)
                     except Exception:
                         pass
+
+        # Set cooldowns BEFORE decrementing — cooldown counts down over subsequent scans
+        for s in fresh_signals:
+            st.session_state.pair_cooldown[s['symbol']] = params.get('cooldown', 0)
+
+        # Decrement cooldowns
+        for k in list(st.session_state.pair_cooldown.keys()):
+            st.session_state.pair_cooldown[k] = max(0, st.session_state.pair_cooldown[k] - 1)
 
         if fresh_signals:
             fresh_signals.sort(key=lambda x: str(x.get('time', '')), reverse=True)
@@ -1818,10 +1827,6 @@ with tab3:
                 }
                 st.session_state.signal_log.append(entry)
                 st.session_state.active_signals[key] = entry
-
-        # Update cooldowns
-        for s in fresh_signals:
-            st.session_state.pair_cooldown[s['symbol']] = params.get('cooldown', 0)
 
         # ── OUTCOME UPDATE: match ACTIVE signals to completed trades ─────────
         # Process up to 5 active signals per heartbeat to stay fast
@@ -1881,6 +1886,23 @@ with tab3:
     # ── LAST 5 SIGNALS FEED ───────────────────────────────────────────────
     st.markdown("#### 📜 Last 5 Signals")
 
+    # Fetch live prices for active signals so we can show live P&L
+    @st.cache_data(ttl=15, show_spinner=False)
+    def get_live_prices(symbols_timeframes: list[tuple]) -> dict:
+        """Fetch latest close for each unique (symbol, tf) pair. Returns {symbol: price}."""
+        result = {}
+        for sym, tf in dict.fromkeys(symbols_timeframes).keys():
+            tf_int = TF_INTERVAL.get(tf, "1m")
+            df = get_candles(sym, tf_int, "5d", count=3)
+            if not df.empty:
+                result[sym] = df.iloc[-1]['close']
+        return result
+
+    live_prices = {}
+    if active_sig:
+        sym_tfs = [(s['symbol'], s['timeframe']) for s in active_sig]
+        live_prices = get_live_prices(sym_tfs)
+
     if last_5:
         for sig in last_5:
             is_buy = sig['direction'] == 'BUY'
@@ -1898,8 +1920,31 @@ with tab3:
                 badge = f'<span style="background:#f44336;color:#fff;font-size:10px;padding:2px 6px;border-radius:4px">✗ LOSS {sig["pnl_pips"]:+.1f}p</span>'
 
             dir_col = '#4caf50' if is_buy else '#f44336'
+
+            # Build extra info block
             extra = ""
-            if not is_active:
+            if is_active:
+                cur_price = live_prices.get(sig['symbol'])
+                if cur_price:
+                    pip_val = get_pip_value(sig['symbol'])
+                    if is_buy:
+                        pnl_pips = (cur_price - sig['entry']) / pip_val
+                        dist_sl = (sig['entry'] - sig['sl']) / pip_val
+                        dist_tp = (sig['tp'] - sig['entry']) / pip_val
+                        pnl_col = '#4caf50' if pnl_pips >= 0 else '#f44336'
+                    else:
+                        pnl_pips = (sig['entry'] - cur_price) / pip_val
+                        dist_sl = (sig['sl'] - sig['entry']) / pip_val
+                        dist_tp = (sig['entry'] - sig['tp']) / pip_val
+                        pnl_col = '#4caf50' if pnl_pips >= 0 else '#f44336'
+                    extra = f"""<div style="color:#bbb;font-size:11px;margin-top:4px">
+                        <span style="color:#fff;font-weight:bold">↗ {cur_price:.5f}</span>
+                        <span style="color:{pnl_col};margin-left:6px;font-weight:bold">{pnl_pips:+.1f}p</span>
+                        <span style="color:#555;margin-left:8px">SL <span style="color:#f44336">{dist_sl:.1f}p</span> | TP <span style="color:#4caf50">{dist_tp:.1f}p</span></span>
+                    </div>"""
+                else:
+                    extra = f"""<div style="color:#555;font-size:11px;margin-top:4px">Live price unavailable — check connection</div>"""
+            else:
                 extra = f"""<div style="color:#aaa;font-size:11px;margin-top:4px">
                     ↗ {sig['exit_price']:.5f} | {sig['hold_candles']}c ({sig['duration_min']:.1f}m) | {sig.get('exit_time','—')}
                 </div>"""
@@ -1931,6 +1976,22 @@ with tab3:
     # ── SIGNAL LOG TABLE ─────────────────────────────────────────────────
     if log:
         st.markdown("#### 📋 Signal Log")
+
+        # Build live price map for active signals
+        live_tbl_prices = {}
+        for s in log:
+            if s['status'] == 'ACTIVE' and s['symbol'] in live_prices:
+                live_tbl_prices[s['symbol']] = live_prices[s['symbol']]
+
+        def _live_pnl(sig, cur):
+            if cur is None:
+                return "—"
+            pip_val = get_pip_value(sig['symbol'])
+            if sig['direction'] == 'BUY':
+                return f"{(cur - sig['entry']) / pip_val:+.1f}p"
+            else:
+                return f"{(sig['entry'] - cur) / pip_val:+.1f}p"
+
         rows = [{
             'St': '🟡' if s['status']=='ACTIVE' else ('🟢' if s['result']=='WIN' else '🔴'),
             'Pair': s['symbol'],
@@ -1938,12 +1999,13 @@ with tab3:
             'TF': s['timeframe'],
             'Dir': s['direction'],
             'Entry': f"{s['entry']:.5f}",
-            'Exit': f"{s['exit_price']:.5f}" if s['exit_price'] else "—",
+            'Now': f"{live_prices.get(s['symbol'], 0):.5f}" if s['status']=='ACTIVE' and s['symbol'] in live_prices else "—",
             'SL': f"{s['sl']:.5f}",
             'TP': f"{s['tp']:.5f}",
             'R:R': f"1:{s['rr']:.1f}",
             'Sc': s['score'],
-            'P&L': f"{s['pnl_pips']:+.1f}p" if s['status']!='ACTIVE' else "—",
+            'P&L': f"{s['pnl_pips']:+.1f}p" if s['status']!='ACTIVE' else (
+                _live_pnl(s, live_prices.get(s['symbol'])) if s['symbol'] in live_prices else "—"),
             'Hold': f"{s['hold_candles']}c" if s['hold_candles'] else "—",
             'Dur': f"{s['duration_min']:.1f}m" if s['duration_min'] else "—",
             'Time': s['logged_at'],
@@ -1966,7 +2028,7 @@ with tab3:
                 "TF": st.column_config.TextColumn("TF", width="tiny"),
                 "Dir": st.column_config.TextColumn("Dir", width="small"),
                 "Entry": st.column_config.TextColumn("Entry", width="medium"),
-                "Exit": st.column_config.TextColumn("Exit", width="medium"),
+                "Now": st.column_config.TextColumn("Now", width="medium"),
                 "SL": st.column_config.TextColumn("SL", width="medium"),
                 "TP": st.column_config.TextColumn("TP", width="medium"),
                 "R:R": st.column_config.TextColumn("R:R", width="tiny"),
@@ -2005,5 +2067,6 @@ with tab3:
         f"{mode_label} | {scan_tf} | Log: {len(log)}/{max_log} | Active: {len(active_sig)}"
     )
 
-    # ── AUTO-REFRESH: only for display polling, state already updated above ─
-    st_autorefresh(interval=10000, key="scanner_v9")
+    # ── AUTO-REFRESH: only active when not paused ──────────────────────────
+    if not st.session_state.scan_paused:
+        st_autorefresh(interval=10000, key="scanner_v9")
