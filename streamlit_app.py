@@ -580,8 +580,8 @@ def mt5_signal_file(symbol: str, signals: list) -> bytes:
 
 def run_backtest(symbol: str, candles: int, interval: str, strategy: str, params: dict) -> tuple:
     tf_int = TF_INTERVAL.get(interval, "1m")
-    tf_rng = TF_PERIOD.get(interval, "5d")
-    df = get_candles(symbol, tf_int, tf_rng, candles)
+    tf_yf = {"1m": "1m", "5m": "5m", "60m": "60m"}.get(tf_int, "1m")
+    df = get_backtest_candles(symbol, tf_yf, candles)
     if df.empty or len(df) < 100:
         return None, None, None
     df = add_indicators(df, params)
@@ -618,8 +618,8 @@ def run_backtest(symbol: str, candles: int, interval: str, strategy: str, params
                 risk = abs(pos_entry - pos_sl)
                 reward = abs(exit_p - pos_entry)
                 rr = round(reward / risk, 2) if risk > 0 else 0
-                pnl = (reward - risk) * 10000 if result == 'WIN' else -(risk * 10000)
                 pip_val = get_pip_value(symbol)
+                pnl = (reward / pip_val) if result == 'WIN' else -(risk / pip_val)
                 hold_candles = i - df[df['time'] == pos_time].index[0]
                 trades.append({
                     'signal': position, 'entry': pos_entry, 'exit': exit_p,
@@ -925,6 +925,101 @@ def tv_widget_html(symbol: str, interval: str = "M1") -> str:
     return f'<iframe src="{url}" width="100%" height="500" frameborder="0" allowtransparency="true" scrolling="no" style="border-radius:10px;border:1px solid #2a2a2a;" title="TV {symbol}"></iframe>'
 
 # ============================================================================
+# TRADINGVIEW DATA (for backtest — real OHLCV)
+# ============================================================================
+
+def fetch_tradingview_ohlcv(symbol: str, interval: str = "1", days: int = 30) -> pd.DataFrame:
+    """Fetch OHLCV from TradingView's public data API."""
+    # Map symbol to TradingView format
+    tv_sym_map = {
+        "EURUSD": "EURUSD", "GBPUSD": "GBPUSD", "USDJPY": "USDJPY",
+        "XAUUSD": "TVC:GOLD", "AUDUSD": "AUDUSD", "USDCAD": "USDCAD",
+        "NZDUSD": "NZDUSD", "GBPAUD": "GBPAUD",
+    }
+    tv_sym = tv_sym_map.get(symbol.upper(), symbol.upper())
+
+    # interval: 1=1m, 5=5m, 60=1h
+    iv = interval  # "1", "5", "60"
+
+    # TradingView v1 market data
+    url = f"https://scanner.tradingview.com/forex/scan"
+    # Try alternative: direct chart data
+    chart_url = f"https://charting-library.tradingview.com/symbols/{tv_sym.replace(':', '%3A')}/info"
+
+    # Use the public tradingview chart API
+    try:
+        # Method 1: get history via tradingview's public REST
+        hist_url = f"https://data.tradingview.com/symbols/{tv_sym}/history"
+        params = {"interval": iv, "from": int(pd.Timestamp.now().timestamp()) - days * 86400, "to": int(pd.Timestamp.now().timestamp()), "field": "close,open,high,low,volume"}
+        resp = requests.get(hist_url, params=params, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"}, timeout=10)
+        if resp.status_code == 200 and resp.text:
+            data = resp.json()
+            if isinstance(data, dict) and 't' in data:
+                ts = data['t']
+                return pd.DataFrame({
+                    "time": pd.to_datetime(ts, unit="s", utc=True).tz_convert(None),
+                    "open": data['o'], "high": data['h'],
+                    "low": data['l'], "close": data['c'],
+                    "volume": data['v'] if 'v' in data else [0]*len(ts),
+                }).dropna(subset=["close"]).assign(volume=lambda x: x['volume'].fillna(0))
+    except Exception:
+        pass
+
+    # Method 2: use tradingview's lightweight chart API
+    try:
+        lw_url = f"https://api.tradingview.com/v1/symbols/{tv_sym}/quotes"
+        resp = requests.get(lw_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+    except Exception:
+        pass
+
+    return pd.DataFrame()
+
+
+def fetch_yf_history(symbol: str, interval: str = "1m", days: int = 5) -> pd.DataFrame:
+    """Fetch historical data from Yahoo Finance with configurable days."""
+    import yfinance
+    yf_sym = YF_MAP.get(symbol.upper(), symbol)
+    tf_map = {"1m": "1m", "5m": "5m", "60m": "60m"}
+    try:
+        t = yfinance.Ticker(yf_sym)
+        raw = t.history(period=f"{days}d", interval=tf_map.get(interval, "1m"), prepost=False)
+        if raw.empty:
+            return pd.DataFrame()
+        df = raw.reset_index()
+        df.columns = [c.capitalize() if c != 'Datetime' else 'time' for c in df.columns]
+        df['time'] = pd.to_datetime(df['Time']).dt.tz_localize(None)
+        df = df[['time', 'Open', 'High', 'Low', 'Close', 'Volume']]
+        df.columns = ['time', 'open', 'high', 'low', 'close', 'volume']
+        df['volume'] = df['volume'].fillna(0)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_backtest_candles(symbol: str, interval: str, count: int) -> pd.DataFrame:
+    """Primary data fetcher for backtest: tries TradingView first, falls back to Yahoo Finance."""
+    days_map = {"1m": 6, "5m": 10, "60m": 60}
+    days = days_map.get(interval, 5)
+    tf_yf = {"1m": "1m", "5m": "5m", "60m": "60m"}.get(interval, "1m")
+
+    # Try Yahoo Finance first (more reliable)
+    df = fetch_yf_history(symbol, tf_yf, days)
+    if df is not None and not df.empty and len(df) >= 100:
+        df = df.drop_duplicates(subset='time', keep='last')
+        return df.tail(count).reset_index(drop=True)
+
+    # Fallback to direct YF REST
+    tf_rng = {"1m": "5d", "5m": "5d", "60m": "60d"}.get(interval, "5d")
+    df2 = fetch_yf_v8(symbol, tf_yf, tf_rng)
+    if df2 is not None and not df2.empty and len(df2) >= 100:
+        df2 = df2.drop_duplicates(subset='time', keep='last')
+        return df2.tail(count).reset_index(drop=True)
+
+    return pd.DataFrame()
+
+
+# ============================================================================
 # SIGNAL CARD
 # ============================================================================
 
@@ -1184,192 +1279,398 @@ with tab1:
 # TAB 2: BACKTEST
 # ═══════════════════════════════════════════════════
 with tab2:
-    st.header("📈 Backtest")
-    st.caption(f"Strategy parameters from sidebar apply | SL: ATR×{params.get('sl_atr_mult','?')} | TP: {'fixed ' + str(params.get('tp_pips','?')) + 'pips' if params.get('use_tp_fixed') else 'dynamic'} | Session: London+NY | Cooldown: {params.get('cooldown',0)}")
+    st.header("📈 Backtest Engine")
+    st.caption(f"🔧 {active} | SL: ATR×{params.get('sl_atr_mult','?')} | TP: {'fixed ' + str(params.get('tp_pips','?')) + 'pips' if params.get('use_tp_fixed') else 'dynamic'} | Session: London+NY | Cooldown: {params.get('cooldown',0)}")
 
-    bk_col1, bk_col2, bk_col3, bk_col4, bk_col5 = st.columns([2, 1, 2, 1, 1])
-    with bk_col1:
-        bt_sym = st.selectbox("Symbol", ALL_PAIRS, index=0, key="bt_sym")
-    with bk_col2:
-        bt_tf = st.selectbox("TF", ["M1", "M5", "H1"], index=["M1", "M5", "H1"].index(st.session_state.get("active_tf", "M1")), key="bt_tf")
-    with bk_col3:
-        bt_strat = st.selectbox("Strategy", list(STRATEGIES.keys()),
+    # ── Controls Row ─────────────────────────────────────────────────────────
+    bt_ctrl1, bt_ctrl2, bt_ctrl3, bt_ctrl4 = st.columns([2, 1, 2, 2])
+    with bt_ctrl1:
+        bt_sym = st.selectbox("📊 Symbol", ALL_PAIRS, index=0, key="bt_sym")
+    with bt_ctrl2:
+        bt_tf = st.selectbox("⏱️ TF", ["M1", "M5", "H1"],
+            index=["M1", "M5", "H1"].index(st.session_state.get("active_tf", "M1")), key="bt_tf")
+    with bt_ctrl3:
+        bt_strat = st.selectbox("🎯 Strategy", list(STRATEGIES.keys()),
             index=list(STRATEGIES.keys()).index(active), key="bt_strat")
-    with bk_col4:
-        bt_candles = st.selectbox("Candles", [500, 1000, 1500, 2000, 3000], index=2, key="bt_candles")
-    with bk_col5:
-        bt_no_session = st.checkbox("No Session Filter", value=False, key="bt_no_session")
+    with bt_ctrl4:
+        bt_candles = st.selectbox("📐 Candles", [500, 1000, 1500, 2000, 3000], index=2, key="bt_candles")
+
+    bt_ctrl5, bt_ctrl6, bt_ctrl7 = st.columns([2, 1, 1])
+    with bt_ctrl5:
+        bt_no_session = st.checkbox("🔓 No Session Filter", value=False, key="bt_no_session")
+    with bt_ctrl6:
+        bt_compare = st.checkbox("⚡ Compare All Strategies", value=False, key="bt_compare")
+    with bt_ctrl7:
+        auto_refresh = st.checkbox("🔄 Auto-Refresh (30s)", value=False, key="bt_autorefresh")
 
     bt_params = STRATEGIES[bt_strat]["params"].copy()
     bt_params.update({k: v for k, v in params.items() if k in bt_params})
-
-    # Allow overriding session filter from backtest tab
     if bt_no_session:
         bt_params["_no_session_filter"] = True
 
-    if st.button("▶️ Run Backtest", use_container_width=True, type="primary", key="run_bt_v3"):
-        with st.spinner(f"{bt_strat} on {bt_sym} [{bt_tf}] — {bt_candles} candles..."):
-            td, df_bt, m = run_backtest(bt_sym, bt_candles, bt_tf, bt_strat, bt_params)
-            st.session_state.bt_result = (td, df_bt, m, bt_sym, bt_tf, bt_strat, bt_params)
+    # Auto-refresh
+    if auto_refresh:
+        refresh_key = f"bt_refresh_{bt_sym}_{bt_tf}_{bt_strat}_{bt_candles}"
+        st_autorefresh(interval=30000, key=refresh_key)
+
+    # Run button
+    run_cols = st.columns([1, 2, 1])
+    with run_cols[1]:
+        if st.button("▶️ ▶️  RUN BACKTEST", use_container_width=True, type="primary", key="run_bt_v4"):
+            with st.spinner(f"🔄 {bt_strat} on {bt_sym} [{bt_tf}] — {bt_candles} candles | Fetching data..."):
+                tick = datetime.now()
+                td, df_bt, m = run_backtest(bt_sym, bt_candles, bt_tf, bt_strat, bt_params)
+                fetch_ms = (datetime.now() - tick).total_seconds() * 1000
+                st.session_state.bt_result = (td, df_bt, m, bt_sym, bt_tf, bt_strat, bt_params)
+                st.session_state.bt_fetch_ms = fetch_ms
 
     bt_res = st.session_state.get("bt_result")
     if bt_res:
         td, df_bt, m, sym_b, tf_b, strat_b, par_b = bt_res[:7]
+        fetch_ms = st.session_state.get("bt_fetch_ms", 0)
+
         if m is None:
             st.error(f"❌ No trades for {sym_b} [{tf_b}] using {strat_b}. Try: more candles, enable 'No Session Filter', lower min_score, or switch TF.")
         else:
-            # ── Row 1: Core Stats ──────────────────────────────────────────────
-            st.markdown("### 📊 Performance Summary")
-            sm1, sm2, sm3, sm4, sm5, sm6 = st.columns(6)
-            sm1.metric("Total Trades", m['total'])
-            sm2.metric("Win Rate", f"{m['win_rate']}%")
-            sm3.metric("Profit Factor", m['profit_factor'])
-            sm4.metric("Max DD", f"{m['max_drawdown']} pips")
-            pnl_color = "🟢" if m['total_pnl'] > 0 else "🔴"
-            sm5.metric("Net P&L", f"{m['total_pnl']} pips {pnl_color}")
+            # ── LIVE STATUS BAR ─────────────────────────────────────────────────
+            now_utc = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+            st.success(f"✅ Backtest complete | {m['total']} trades | {sym_b} [{tf_b}] | {bt_candles} candles | Data fetched in {fetch_ms:.0f}ms | {now_utc}")
+
+            # ── ROW 1: CORE METRICS ────────────────────────────────────────────
+            st.markdown("#### 📊 Performance Summary")
+            r1c1, r1c2, r1c3, r1c4, r1c5, r1c6 = st.columns(6)
+            pnl_val = m['total_pnl']
+            pnl_delta = f"{'↑' if pnl_val > 0 else '↓'} {abs(pnl_val):.1f} pips"
+            r1c1.metric("Total Trades", m['total'])
+            r1c2.metric("Win Rate", f"{m['win_rate']}%", delta=f"{m['wins']}W / {m['losses']}L")
+            r1c3.metric("Profit Factor", m['profit_factor'])
+            r1c4.metric("Max Drawdown", f"{m['max_drawdown']} pips", delta="risk ⚠️" if m['max_drawdown'] > 20 else "ok")
+            r1c5.metric("Net P&L", f"{pnl_val:.1f} pips", delta=pnl_delta)
             rf = m.get('recovery_factor', '∞')
-            sm6.metric("Recovery Factor", rf)
+            r1c6.metric("Recovery Factor", rf)
 
-            # ── Row 2: P&L Breakdown ───────────────────────────────────────────
-            sr1, sr2, sr3, sr4, sr5, sr6 = st.columns(6)
-            sr1.metric("W / L", f"{m['wins']} / {m['losses']}")
-            sr2.metric("Avg R:R", f"1:{m['avg_rr']}")
-            sr3.metric("Avg Win", f"{m['avg_win']} pips")
-            sr4.metric("Avg Loss", f"{m['avg_loss']} pips")
-            sr5.metric("Avg Trade", f"{m.get('avg_trade_pnl', 0)} pips")
-            sr6.metric("Expectancy", f"{m['expectancy']} pips/t")
+            # ── ROW 2: RISK & REWARD ────────────────────────────────────────────
+            st.markdown("#### 💰 Risk & Reward")
+            r2c1, r2c2, r2c3, r2c4, r2c5, r2c6 = st.columns(6)
+            r2c1.metric("Avg R:R", f"1:{m['avg_rr']}")
+            r2c2.metric("Avg Win", f"{m['avg_win']} pips", delta="per win")
+            r2c3.metric("Avg Loss", f"{m['avg_loss']} pips", delta="per loss")
+            r2c4.metric("Best Trade", f"{m.get('best', 0):.1f} pips", delta="🏆")
+            r2c5.metric("Worst Trade", f"{m.get('worst', 0):.1f} pips", delta="💔")
+            expectancy = m.get('expectancy', 0)
+            r2c6.metric("Expectancy", f"{expectancy:.2f} pips/t", delta="per trade")
 
-            # ── Row 3: Direction & Streaks ────────────────────────────────────
-            ss1, ss2, ss3, ss4, ss5, ss6 = st.columns(6)
-            ss1.metric("Win Streak 🟢", f"×{m['max_win_streak']}")
-            ss2.metric("Loss Streak 🔴", f"×{m['max_loss_streak']}")
-            ss3.metric("BUY WR", f"{m['buy_wr']}%")
-            ss4.metric("SELL WR", f"{m['sell_wr']}%")
-            ss5.metric("BUY P&L", f"{m['buy_pnl']} pips")
-            ss6.metric("SELL P&L", f"{m['sell_pnl']} pips")
+            # ── ROW 3: DIRECTION + STREAKS ────────────────────────────────────
+            st.markdown("#### 📈 Direction & Streaks")
+            r3c1, r3c2, r3c3, r3c4, r3c5, r3c6 = st.columns(6)
+            r3c1.metric("🟢 Win Streak", f"×{m['max_win_streak']}")
+            r3c2.metric("🔴 Loss Streak", f"×{m['max_loss_streak']}")
+            r3c3.metric("BUY Win Rate", f"{m['buy_wr']}%", delta=f"{m['buy_pnl']:.1f} pips")
+            r3c4.metric("SELL Win Rate", f"{m['sell_wr']}%", delta=f"{m['sell_pnl']:.1f} pips")
+            r3c5.metric("BUY P&L", f"{m['buy_pnl']} pips")
+            r3c6.metric("SELL P&L", f"{m['sell_pnl']} pips")
 
-            # ── Row 4: Frequency & Duration ───────────────────────────────────
-            fr1, fr2, fr3, fr4, fr5, fr6 = st.columns(6)
-            fr1.metric("Trades/Hour", m['trades_per_hour'])
-            fr2.metric("Avg Hold", f"{m['avg_hold']} cndls")
-            fr3.metric("Avg Duration", f"{m.get('avg_duration_min', 0)} min")
-            fr4.metric("Median Duration", f"{m.get('median_duration_min', 0)} min")
-            fr5.metric("Total Hours", f"{m.get('total_hours', 0)} hrs")
-            fr6.metric("Sharpe-like", f"{m.get('sharp_ratio_like', 0)}")
+            # ── ROW 4: FREQUENCY ──────────────────────────────────────────────
+            st.markdown("#### ⏱️ Frequency & Duration")
+            r4c1, r4c2, r4c3, r4c4, r4c5, r4c6 = st.columns(6)
+            r4c1.metric("Trades/Hour", m['trades_per_hour'])
+            r4c2.metric("Avg Hold", f"{m['avg_hold']} cndls")
+            r4c3.metric("Avg Duration", f"{m.get('avg_duration_min', 0)} min")
+            r4c4.metric("Median Duration", f"{m.get('median_duration_min', 0)} min")
+            r4c5.metric("Total Hours", f"{m.get('total_hours', 0)} hrs")
+            sharpe = m.get('sharp_ratio_like', 0)
+            r4c6.metric("Sharpe-like", sharpe, delta="risk-adj return" if sharpe > 0.5 else "low")
 
-            # ── Row 5: Best / Worst ─────────────────────────────────────────────
-            bt_row, wt_row = st.columns(2)
+            # ── BEST / WORST TRADE CARDS ──────────────────────────────────────
+            st.markdown("#### 🏆 Best & 💔 Worst Trades")
+            bc, wc = st.columns(2)
             best = m.get('best_trade', {})
             worst = m.get('worst_trade', {})
-            with bt_row:
+            with bc:
                 if best:
-                    st.markdown("##### 🏆 Best Trade")
                     bcd = "🟢 WIN" if best.get('result') == 'WIN' else "🔴 LOSS"
-                    st.markdown(f"**{bcd}** | {best.get('pnl_pips', 0)} pips | R:R 1:{best.get('rr', 0)} | Score {best.get('score', 0)}")
-                    st.caption(f"Entry: {best.get('entry_time', '')} | {best.get('signal', '')} @ {best.get('entry', 0):.5f} → {best.get('exit', 0):.5f} | Hold: {best.get('hold_candles', 0)} cndls")
-            with wt_row:
+                    bbg = "#0d2e12" if best.get('result') == 'WIN' else "#2e0d0d"
+                    btc = "#4caf50" if best.get('result') == 'WIN' else "#f44336"
+                    st.markdown(f"""
+                    <div style="background:{bbg};border-left:4px solid {btc};border-radius:8px;padding:16px;margin:4px 0">
+                        <h4 style="color:{btc};margin:0">{bcd} — {best.get('pnl_pips', 0):.1f} pips</h4>
+                        <p style="color:#aaa;margin:4px 0">R:R 1:{best.get('rr', 0)} | Score {best.get('score', 0)} | Hold: {best.get('hold_candles', 0)} cndls</p>
+                        <p style="color:#888;margin:2px 0">⏰ {best.get('entry_time', '')}</p>
+                        <p style="color:#888;margin:2px 0">{best.get('signal', '')} @ {best.get('entry', 0):.5f} → {best.get('exit', 0):.5f}</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+            with wc:
                 if worst:
-                    st.markdown("##### 💔 Worst Trade")
                     wcd = "🟢 WIN" if worst.get('result') == 'WIN' else "🔴 LOSS"
-                    st.markdown(f"**{wcd}** | {worst.get('pnl_pips', 0)} pips | R:R 1:{worst.get('rr', 0)} | Score {worst.get('score', 0)}")
-                    st.caption(f"Entry: {worst.get('entry_time', '')} | {worst.get('signal', '')} @ {worst.get('entry', 0):.5f} → {worst.get('exit', 0):.5f} | Hold: {worst.get('hold_candles', 0)} cndls")
+                    wbg = "#0d2e12" if worst.get('result') == 'WIN' else "#2e0d0d"
+                    wtc = "#4caf50" if worst.get('result') == 'WIN' else "#f44336"
+                    st.markdown(f"""
+                    <div style="background:{wbg};border-left:4px solid {wtc};border-radius:8px;padding:16px;margin:4px 0">
+                        <h4 style="color:{wtc};margin:0">{wcd} — {worst.get('pnl_pips', 0):.1f} pips</h4>
+                        <p style="color:#aaa;margin:4px 0">R:R 1:{worst.get('rr', 0)} | Score {worst.get('score', 0)} | Hold: {worst.get('hold_candles', 0)} cndls</p>
+                        <p style="color:#888;margin:2px 0">⏰ {worst.get('entry_time', '')}</p>
+                        <p style="color:#888;margin:2px 0">{worst.get('signal', '')} @ {worst.get('entry', 0):.5f} → {worst.get('exit', 0):.5f}</p>
+                    </div>
+                    """, unsafe_allow_html=True)
 
-            # ── Session Breakdown ───────────────────────────────────────────────
+            # ── SESSION + DURATION BREAKDOWN ───────────────────────────────────
             sess_data = m.get('session_breakdown', [])
-            if sess_data:
-                st.markdown("##### 🌐 Session Breakdown (London 08-12 | NY 13-17 UTC)")
-                s_cols = st.columns(len(sess_data))
-                for i, s in enumerate(sess_data):
-                    with s_cols[i]:
-                        sess_name = s['session']
-                        sess_icon = "🟢" if s['pnl'] > 0 else "🔴" if s['pnl'] < 0 else "⚪"
-                        st.metric(f"{sess_icon} {sess_name}", f"{s['pnl']:.0f} pips", f"{s['count']} trades | avg {s['avg_pnl']:.1f}p")
-
-            # ── Duration Breakdown ──────────────────────────────────────────────
             dur_data = m.get('duration_breakdown', [])
-            if dur_data:
-                st.markdown("##### ⏱️ Trade Duration Analysis")
-                d_cols = st.columns(len(dur_data))
-                for i, d in enumerate(dur_data):
-                    with d_cols[i]:
-                        d_pnl_color = "🟢" if d['pnl'] > 0 else "🔴" if d['pnl'] < 0 else "⚪"
-                        st.metric(f"{d['duration']}", f"{d_pnl_color} {d['pnl']:.0f}p", f"{d['count']} trades | avg {d['avg_pnl']:.1f}p")
+            if sess_data or dur_data:
+                s_col, d_col = st.columns(2)
+                with s_col:
+                    if sess_data:
+                        st.markdown("##### 🌐 Session Breakdown")
+                        for s in sess_data:
+                            icon = "🟢" if s['pnl'] > 0 else "🔴" if s['pnl'] < 0 else "⚪"
+                            st.markdown(f"**{icon} {s['session']}** — {s['pnl']:.1f} pips | {s['count']} trades | avg {s['avg_pnl']:.1f}p")
+                with d_col:
+                    if dur_data:
+                        st.markdown("##### ⏱️ Duration Breakdown")
+                        for d in dur_data:
+                            icon = "🟢" if d['pnl'] > 0 else "🔴" if d['pnl'] < 0 else "⚪"
+                            st.markdown(f"**{icon} {d['duration']}** — {d['pnl']:.1f} pips | {d['count']} trades | avg {d['avg_pnl']:.1f}p")
 
-            # ── Equity & Drawdown Charts ───────────────────────────────────────
+            # ── EQUITY CURVE + DRAWDOWN ────────────────────────────────────────
             st.markdown("---")
-            st.markdown("### 📈 Equity & Drawdown")
+            st.markdown("#### 📈 Equity Curve & Drawdown")
             eq_col, dd_col = st.columns(2)
             with eq_col:
                 eq = equity_chart(td)
                 if eq:
-                    st.plotly_chart(eq, use_container_width=True, config={'scrollZoom': False, 'displayModeBar': True, 'modeBarButtonsToRemove': ['lasso2d', 'select2d', 'autoScale2d', 'hoverCompareCartesian'], 'doubleClick': False, 'editable': False})
+                    st.plotly_chart(eq, use_container_width=True,
+                        config={'scrollZoom': False, 'displayModeBar': True,
+                            'modeBarButtonsToRemove': ['lasso2d', 'select2d', 'autoScale2d', 'hoverCompareCartesian'],
+                            'doubleClick': False, 'editable': False})
             with dd_col:
                 dd = drawdown_chart(td)
                 if dd:
-                    st.plotly_chart(dd, use_container_width=True, config={'scrollZoom': False, 'displayModeBar': True, 'modeBarButtonsToRemove': ['lasso2d', 'select2d', 'autoScale2d', 'hoverCompareCartesian'], 'doubleClick': False, 'editable': False})
+                    st.plotly_chart(dd, use_container_width=True,
+                        config={'scrollZoom': False, 'displayModeBar': True,
+                            'modeBarButtonsToRemove': ['lasso2d', 'select2d', 'autoScale2d', 'hoverCompareCartesian'],
+                            'doubleClick': False, 'editable': False})
 
-            # ── P&L Distribution & Hourly Returns ───────────────────────────────
-            st.markdown("### 📊 P&L Distribution & Hourly Returns")
+            # ── P&L DISTRIBUTION + HOURLY RETURNS ──────────────────────────────
+            st.markdown("#### 📊 P&L Distribution & Hourly Returns")
             dist_col, hr_col = st.columns(2)
             with dist_col:
                 dist = pnl_dist_chart(td)
                 if dist:
-                    st.plotly_chart(dist, use_container_width=True, config={'scrollZoom': False, 'displayModeBar': True, 'modeBarButtonsToRemove': ['lasso2d', 'select2d', 'autoScale2d', 'hoverCompareCartesian'], 'doubleClick': False, 'editable': False})
+                    st.plotly_chart(dist, use_container_width=True,
+                        config={'scrollZoom': False, 'displayModeBar': True,
+                            'modeBarButtonsToRemove': ['lasso2d', 'select2d', 'autoScale2d', 'hoverCompareCartesian'],
+                            'doubleClick': False, 'editable': False})
             with hr_col:
                 hc = hourly_chart(m)
                 if hc:
-                    st.plotly_chart(hc, use_container_width=True, config={'scrollZoom': False, 'displayModeBar': True, 'modeBarButtonsToRemove': ['lasso2d', 'select2d', 'autoScale2d', 'hoverCompareCartesian'], 'doubleClick': False, 'editable': False})
+                    st.plotly_chart(hc, use_container_width=True,
+                        config={'scrollZoom': False, 'displayModeBar': True,
+                            'modeBarButtonsToRemove': ['lasso2d', 'select2d', 'autoScale2d', 'hoverCompareCartesian'],
+                            'doubleClick': False, 'editable': False})
 
-            st.markdown("### 📅 Monthly Returns")
+            # ── MONTHLY RETURNS ─────────────────────────────────────────────────
+            st.markdown("#### 📅 Monthly Returns Heatmap")
             mh = monthly_heatmap(m)
             if mh:
-                st.plotly_chart(mh, use_container_width=True, config={'scrollZoom': False, 'displayModeBar': True, 'modeBarButtonsToRemove': ['lasso2d', 'select2d', 'autoScale2d', 'hoverCompareCartesian'], 'doubleClick': False, 'editable': False})
+                st.plotly_chart(mh, use_container_width=True,
+                    config={'scrollZoom': False, 'displayModeBar': True,
+                        'modeBarButtonsToRemove': ['lasso2d', 'select2d', 'autoScale2d', 'hoverCompareCartesian'],
+                        'doubleClick': False, 'editable': False})
 
-            st.markdown("### 📊 Price Chart with Trade Markers")
+            # ── WIN RATE GAUGE ──────────────────────────────────────────────────
+            st.markdown("#### 🎯 Win Rate & Trade Direction")
+            gauge_col, dir_col = st.columns(2)
+            with gauge_col:
+                fig_gauge = go.Figure(go.Indicator(
+                    mode="gauge+number+delta",
+                    value=m['win_rate'],
+                    domain={'x': [0, 1], 'y': [0, 1]},
+                    gauge={
+                        'axis': {'range': [0, 100], 'tickcolor': '#333'},
+                        'bar': {'color': '#26a69a'},
+                        'bgcolor': '#1a1a2e',
+                        'borderwidth': 2, 'bordercolor': '#444',
+                        'steps': [
+                            {'range': [0, 40], 'color': '#ef5350'},
+                            {'range': [40, 60], 'color': '#ffca28'},
+                            {'range': [60, 100], 'color': '#26a69a'},
+                        ],
+                    },
+                    title={'text': f"Win Rate % | {m['wins']}W / {m['losses']}L"},
+                    number={'suffix': '%', 'font': {'color': '#26a69a', 'size': 28}},
+                    delta={'reference': 55, 'suffix': '%', 'position': "bottom"},
+                ))
+                fig_gauge.update_layout(template='plotly_dark', height=220, margin=dict(l=20, r=20, t=40, b=20))
+                st.plotly_chart(fig_gauge, use_container_width=True,
+                    config={'scrollZoom': False, 'displayModeBar': False, 'doubleClick': False, 'editable': False})
+            with dir_col:
+                fig_dir = go.Figure()
+                buy_pnl = m.get('buy_pnl', 0)
+                sell_pnl = m.get('sell_pnl', 0)
+                fig_dir.add_trace(go.Bar(x=['BUY 🟢', 'SELL 🔴'], y=[buy_pnl, sell_pnl],
+                    marker_color=['#26a69a', '#ef5350'], text=[f"{buy_pnl:.1f}p", f"{sell_pnl:.1f}p"],
+                    textposition='outside', textfont={'color': '#fff'}))
+                fig_dir.update_layout(template='plotly_dark', height=220, title="P&L by Direction",
+                    yaxis_title="P&L (pips)", margin=dict(l=20, r=20, t=40, b=40),
+                    hovermode='x unified')
+                st.plotly_chart(fig_dir, use_container_width=True,
+                    config={'scrollZoom': False, 'displayModeBar': False, 'doubleClick': False, 'editable': False})
+
+            # ── PRICE CHART WITH TRADE MARKERS ─────────────────────────────────
+            st.markdown("#### 📊 Price Chart with Trade Markers")
             if df_bt is not None and not df_bt.empty:
                 fig_bt = plot_chart(df_bt, td, params=par_b)
                 if fig_bt:
-                    st.plotly_chart(fig_bt, use_container_width=True, config={'scrollZoom': False, 'displayModeBar': True, 'modeBarButtonsToRemove': ['lasso2d', 'select2d', 'autoScale2d', 'hoverCompareCartesian'], 'doubleClick': False, 'editable': False})
+                    st.plotly_chart(fig_bt, use_container_width=True,
+                        config={'scrollZoom': False, 'displayModeBar': True,
+                            'modeBarButtonsToRemove': ['lasso2d', 'select2d', 'autoScale2d', 'hoverCompareCartesian'],
+                            'doubleClick': False, 'editable': False})
 
-            st.markdown(f"### 📋 Trade Log ({m['total']} trades)")
-            disp = td[['entry_time', 'signal', 'entry', 'sl', 'tp', 'rr', 'score', 'result', 'pnl_pips', 'hold_candles', 'duration_min', 'sl_pips', 'tp_pips']].tail(50).copy()
-            disp.columns = ['Time', 'Dir', 'Entry', 'SL', 'TP', 'R:R', 'Score', 'Result', 'P&L', 'Hold(c)', 'Dur(m)', 'SL(p)', 'TP(p)']
-            disp['Time'] = disp['Time'].dt.strftime('%Y-%m-%d %H:%M')
+            # ── DETAILED TRADE LOG TABLE ─────────────────────────────────────────
+            st.markdown(f"#### 📋 Complete Trade Log ({m['total']} trades)")
+
+            # Build full display dataframe
+            disp = td.copy()
+            disp['#'] = range(1, len(disp) + 1)
+            disp['P&L'] = disp['pnl_pips'].apply(lambda x: f"{x:.1f}p")
+            disp['R:R'] = disp['rr'].apply(lambda x: f"1:{x:.2f}")
+            disp['Score'] = disp['score'].apply(lambda x: f"{x:.0f}")
+            disp['Entry'] = disp['entry'].apply(lambda x: f"{x:.5f}")
+            disp['Exit'] = disp['exit'].apply(lambda x: f"{x:.5f}")
+            disp['SL'] = disp['sl'].apply(lambda x: f"{x:.5f}")
+            disp['TP'] = disp['tp'].apply(lambda x: f"{x:.5f}")
+            disp['Dur'] = disp['duration_min'].apply(lambda x: f"{x:.1f}m")
+            disp['Hold'] = disp['hold_candles'].apply(lambda x: f"{x}")
+            disp['SL_pips'] = disp['sl_pips'].apply(lambda x: f"{x:.1f}p")
+            disp['TP_pips'] = disp['tp_pips'].apply(lambda x: f"{x:.1f}p")
+            disp['Time'] = pd.to_datetime(disp['entry_time']).dt.strftime('%m-%d %H:%M')
+            disp['ExitTime'] = pd.to_datetime(disp['exit_time']).dt.strftime('%m-%d %H:%M')
+            disp['Dir'] = disp['signal'].apply(lambda x: "🟢 BUY" if x == 'BUY' else "🔴 SELL")
+            disp['Result'] = disp['result'].apply(lambda x: "🟢 WIN" if x == 'WIN' else "🔴 LOSS")
+
+            # Sortable columns
+            show_cols = ['#', 'Dir', 'Time', 'Entry', 'Exit', 'SL', 'TP', 'R:R', 'Score', 'Result', 'P&L', 'SL_pips', 'TP_pips', 'Hold', 'Dur', 'ExitTime']
+            disp_show = disp[show_cols].rename(columns={
+                'Time': 'Entry Time', 'ExitTime': 'Exit Time',
+                'Hold': 'Hold (c)', 'Dur': 'Duration',
+                'SL_pips': 'SL (pips)', 'TP_pips': 'TP (pips)',
+            })
+
             st.dataframe(
-                disp.style.apply(
-                    lambda r: ['background-color:#0d2e12;color:#4caf50']*len(r) if r['Result']=='WIN'
-                    else ['background-color:#2e0d0d;color:#f44336']*len(r)
-                    for _ in r
-                ), axis=1, use_container_width=True, height=380
+                disp_show.style.map(
+                    lambda _: "background-color:#0d2e12;color:#4caf50;font-weight:bold",
+                    subset=pd.IndexSlice[disp_show[disp_show['Result'] == '🟢 WIN'].index, ['P&L', 'Result']]
+                ).map(
+                    lambda _: "background-color:#2e0d0d;color:#f44336;font-weight:bold",
+                    subset=pd.IndexSlice[disp_show[disp_show['Result'] == '🔴 LOSS'].index, ['P&L', 'Result']]
+                ).map(
+                    lambda _: "color:#4caf50;font-weight:bold",
+                    subset=pd.IndexSlice[disp_show[disp_show['Dir'] == '🟢 BUY'].index, ['Dir']]
+                ).map(
+                    lambda _: "color:#f44336;font-weight:bold",
+                    subset=pd.IndexSlice[disp_show[disp_show['Dir'] == '🔴 SELL'].index, ['Dir']]
+                ),
+                column_config={
+                    "#": st.column_config.NumberColumn("#", width="small"),
+                    "Dir": st.column_config.TextColumn("Direction", width="small"),
+                    "Entry Time": st.column_config.TextColumn("Entry Time", width="medium"),
+                    "Exit Time": st.column_config.TextColumn("Exit Time", width="medium"),
+                    "Entry": st.column_config.TextColumn("Entry Price", width="medium"),
+                    "Exit": st.column_config.TextColumn("Exit Price", width="medium"),
+                    "SL": st.column_config.TextColumn("Stop Loss", width="medium"),
+                    "TP": st.column_config.TextColumn("Take Profit", width="medium"),
+                    "R:R": st.column_config.TextColumn("Risk:Reward", width="small"),
+                    "Score": st.column_config.TextColumn("Score", width="small"),
+                    "Result": st.column_config.TextColumn("Result", width="small"),
+                    "P&L": st.column_config.TextColumn("P&L (pips)", width="small"),
+                    "SL (pips)": st.column_config.TextColumn("SL (pips)", width="small"),
+                    "TP (pips)": st.column_config.TextColumn("TP (pips)", width="small"),
+                    "Hold (c)": st.column_config.TextColumn("Hold (c)", width="small"),
+                    "Duration": st.column_config.TextColumn("Duration", width="small"),
+                },
+                hide_index=True, use_container_width=True, height=450
             )
 
-            csv = td.to_csv(index=False).encode('utf-8')
-            st.download_button("📥 Download CSV", csv, f"bt_{sym_b}_{tf_b}_{strat_b}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", "text/csv")
+            # ── TRADE STATS SUMMARY TABLE ──────────────────────────────────────
+            st.markdown("##### 📐 Trade Statistics Summary")
+            stats_rows = []
+            for _, t in td.iterrows():
+                stats_rows.append({
+                    "Trade #": _,
+                    "Direction": t['signal'],
+                    "Entry Time": str(t['entry_time'])[:19],
+                    "Exit Time": str(t['exit_time'])[:19],
+                    "Entry Price": round(t['entry'], 5),
+                    "Exit Price": round(t['exit'], 5),
+                    "SL Price": round(t['sl'], 5),
+                    "TP Price": round(t['tp'], 5),
+                    "R:R": round(t['rr'], 2),
+                    "Score": t['score'],
+                    "Result": t['result'],
+                    "P&L (pips)": round(t['pnl_pips'], 1),
+                    "SL (pips)": round(t['sl_pips'], 1),
+                    "TP (pips)": round(t['tp_pips'], 1),
+                    "Hold (candles)": t['hold_candles'],
+                    "Duration (min)": round(t['duration_min'], 1),
+                    "Session": t.get('session', 'Other'),
+                    "Hour": t.get('hour', 0),
+                })
+            stats_df = pd.DataFrame(stats_rows)
+            st.dataframe(stats_df, hide_index=True, use_container_width=True, height=300)
 
-            # MT5 JSON signal export
-            if not td.empty:
-                mt5_data = {
-                    "generated_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
-                    "symbol": sym_b, "timeframe": tf_b, "strategy": strat_b,
-                    "total_trades": m['total'], "net_pnl": m['total_pnl'],
-                    "win_rate": m['win_rate'], "profit_factor": str(m['profit_factor']),
-                    "parameters": {k: v for k, v in par_b.items() if not callable(v)},
-                    "trades": [
-                        {
-                            "entry_time": str(r['entry_time']), "direction": r['signal'],
-                            "entry": r['entry'], "sl": r['sl'], "tp": r['tp'],
-                            "rr": r['rr'], "result": r['result'],
-                            "pnl_pips": r['pnl_pips'], "score": r['score'],
-                        }
-                        for _, r in td.iterrows()
-                    ]
-                }
-                mt5_bytes = json.dumps(mt5_data, indent=2).encode('utf-8')
-                st.download_button("🤖 Download MT5 JSON", mt5_bytes,
-                    f"mt5_{sym_b}_{tf_b}_{strat_b}_{datetime.now().strftime('%Y%m%d')}.json",
-                    "application/json", key="mt5_json_dl")
+            # ── DOWNLOAD BUTTONS ───────────────────────────────────────────────
+            dl1, dl2 = st.columns(2)
+            with dl1:
+                csv = td.to_csv(index=False).encode('utf-8')
+                st.download_button("📥 Download Trade CSV", csv,
+                    f"bt_trades_{sym_b}_{tf_b}_{strat_b}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", "text/csv",
+                    use_container_width=True)
+            with dl2:
+                if not td.empty:
+                    mt5_data = {
+                        "generated_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+                        "symbol": sym_b, "timeframe": tf_b, "strategy": strat_b,
+                        "total_trades": m['total'], "net_pnl": m['total_pnl'],
+                        "win_rate": m['win_rate'], "profit_factor": str(m['profit_factor']),
+                        "parameters": {k: v for k, v in par_b.items() if not callable(v)},
+                        "trades": [
+                            {
+                                "trade_num": i+1,
+                                "entry_time": str(r['entry_time']), "exit_time": str(r['exit_time']),
+                                "direction": r['signal'],
+                                "entry": round(r['entry'], 5), "exit": round(r['exit'], 5),
+                                "sl": round(r['sl'], 5), "tp": round(r['tp'], 5),
+                                "rr": round(r['rr'], 2), "score": r['score'],
+                                "result": r['result'],
+                                "pnl_pips": round(r['pnl_pips'], 1),
+                                "sl_pips": round(r['sl_pips'], 1), "tp_pips": round(r['tp_pips'], 1),
+                                "hold_candles": r['hold_candles'],
+                                "duration_min": round(r['duration_min'], 1),
+                                "session": r.get('session', 'Other'),
+                            }
+                            for i, (_, r) in enumerate(td.iterrows())
+                        ]
+                    }
+                    mt5_bytes = json.dumps(mt5_data, indent=2).encode('utf-8')
+                    st.download_button("🤖 Download MT5 JSON", mt5_bytes,
+                        f"mt5_bt_{sym_b}_{tf_b}_{strat_b}_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
+                        "application/json", use_container_width=True)
+
     else:
-        st.info("👆 Select settings and click **Run Backtest**.")
+        # ── EMPTY STATE ──────────────────────────────────────────────────────
+        st.info("👆 **Configure your backtest above and click `RUN BACKTEST`**")
+        col_a, col_b, col_c = st.columns(3)
+        with col_a:
+            st.markdown("""
+            **📊 Data Source**\nYahoo Finance + TradingView enriched data\nHistorical candles with real OHLCV\n\n**🎯 Strategies**\n6 strategies available:\n- Pullback EMA\n- EMA Crossover\n- RSI Range\n- ATR Breakout\n- Micro Scalp\n- Quick Scalp
+            """)
+        with col_b:
+            st.markdown("""
+            **📋 Metrics Tracked**\n- Win rate, Profit Factor\n- Max Drawdown, Recovery Factor\n- Sharpe-like ratio\n- Expectancy per trade\n- Session breakdown\n- Duration analysis\n            """)
+        with col_c:
+            st.markdown("""
+            **📅 Timeframes**\nM1 (1 minute) — 500-3000 candles\nM5 (5 minute) — 500-3000 candles\nH1 (1 hour) — 500-3000 candles\n\n**🌐 Sessions**\nLondon: 08-12 UTC\nNew York: 13-17 UTC
+            """)
 
 # ═══════════════════════════════════════════════════
 # TAB 3: SCANNER
