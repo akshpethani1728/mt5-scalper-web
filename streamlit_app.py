@@ -586,6 +586,9 @@ def scan_pair_historical(symbol: str, interval: str, strategy: str, params: dict
                     'strategy': strategy,
                     'rsi': round(df.iloc[pos_idx]['rsi'], 1),
                     'atr': round(df.iloc[pos_idx]['atr'], 5),
+                    'atr_pct': round(df.iloc[pos_idx]['atr_pct'], 6),
+                    'candle_pct': round(df.iloc[pos_idx]['candle_body_pct'] * 100, 0),
+                    'trend_dist': round(df.iloc[pos_idx]['trend_dist'], 6),
                     'hold_candles': i - pos_idx,
                     'duration_min': round((df.iloc[i]['time'] - pos_time).total_seconds() / 60, 1),
                 })
@@ -662,8 +665,8 @@ def mt5_signal_file(symbol: str, signals: list) -> bytes:
 
 def run_backtest(symbol: str, candles: int, interval: str, strategy: str, params: dict) -> tuple:
     tf_int = TF_INTERVAL.get(interval, "1m")
-    tf_yf = {"1m": "1m", "5m": "5m", "60m": "60m"}.get(tf_int, "1m")
-    df = get_backtest_candles(symbol, tf_yf, candles)
+    tf_rng = TF_PERIOD.get(interval, "5d")
+    df = get_candles(symbol, tf_int, tf_rng, count=candles)
     if df.empty or len(df) < 100:
         return None, None, None
     df = add_indicators(df, params)
@@ -1068,37 +1071,16 @@ def fetch_yf_history(symbol: str, interval: str = "1m", days: int = 5) -> pd.Dat
         if raw.empty:
             return pd.DataFrame()
         df = raw.reset_index()
-        df.columns = [c.capitalize() if c != 'Datetime' else 'time' for c in df.columns]
-        df['time'] = pd.to_datetime(df['Time']).dt.tz_localize(None)
-        df = df[['time', 'Open', 'High', 'Low', 'Close', 'Volume']]
-        df.columns = ['time', 'open', 'high', 'low', 'close', 'volume']
-        df['volume'] = df['volume'].fillna(0)
-        return df
+        # yfinance: after reset_index(), Datetime becomes 'Datetime' column
+        df.columns = ['time' if c.lower() == 'datetime' else c for c in df.columns]
+        df['time'] = pd.to_datetime(df['time']).dt.tz_localize(None)
+        df['volume'] = df['Volume'].fillna(0) if 'Volume' in df.columns else 0
+        return df[['time', 'Open', 'High', 'Low', 'Close', 'volume']].rename(
+            columns={'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close'})
     except Exception:
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_backtest_candles(symbol: str, interval: str, count: int) -> pd.DataFrame:
-    """Primary data fetcher for backtest: tries TradingView first, falls back to Yahoo Finance."""
-    days_map = {"1m": 6, "5m": 10, "60m": 60}
-    days = days_map.get(interval, 5)
-    tf_yf = {"1m": "1m", "5m": "5m", "60m": "60m"}.get(interval, "1m")
-
-    # Try Yahoo Finance first (more reliable)
-    df = fetch_yf_history(symbol, tf_yf, days)
-    if df is not None and not df.empty and len(df) >= 100:
-        df = df.drop_duplicates(subset='time', keep='last')
-        return df.tail(count).reset_index(drop=True)
-
-    # Fallback to direct YF REST
-    tf_rng = {"1m": "5d", "5m": "5d", "60m": "60d"}.get(interval, "5d")
-    df2 = fetch_yf_v8(symbol, tf_yf, tf_rng)
-    if df2 is not None and not df2.empty and len(df2) >= 100:
-        df2 = df2.drop_duplicates(subset='time', keep='last')
-        return df2.tail(count).reset_index(drop=True)
-
-    return pd.DataFrame()
 
 
 # ============================================================================
@@ -1692,60 +1674,11 @@ with tab3:
     if "first_scan_done" not in st.session_state:
         st.session_state.first_scan_done = False
 
-    # ── FIRST SCAN: pre-fill signal log with recent completed trades ──────────
-    # This runs once on first load so the scanner shows real data immediately
-    if not st.session_state.first_scan_done and not st.session_state.scan_paused:
-        st.session_state.first_scan_done = True
-        pairs_to_fill = st.session_state.selected_pairs or ALL_PAIRS[:4]
+    # Remove dead first-scan block (was referencing undefined build_scan_params, scan_mode_local, max_log, strat_name)
 
-        with st.spinner("📡 Loading historical trades..."):
-            for pair in pairs_to_fill:
-                if scan_mode_local == "Active Strategy":
-                    hist = scan_pair_historical(pair, scan_tf, active, build_scan_params(active), max_trades=10)
-                else:
-                    hist = []
-                    for strat in STRATEGIES.keys():
-                        h = scan_pair_historical(pair, scan_tf, strat, build_scan_params(strat), max_trades=5)
-                        hist.extend(h)
-                    hist.sort(key=lambda x: str(x.get('entry_time', '')), reverse=True)
-                    hist = hist[:10]
-
-                for h in hist:
-                    key = f"{h['symbol']}|{h['signal']}|{h.get('strategy','')}|{h.get('timeframe','')}"
-                    if key in st.session_state.active_signals:
-                        continue
-                    entry = {
-                        'id': key,
-                        'symbol': h['symbol'],
-                        'strategy': h.get('strategy', active),
-                        'timeframe': h.get('timeframe', scan_tf),
-                        'direction': h['signal'],
-                        'score': int(h.get('score', 0)),
-                        'rr': float(h.get('rr', 0)),
-                        'entry': float(h['entry']),
-                        'sl': float(h['sl']),
-                        'tp': float(h['tp']),
-                        'rsi': float(h.get('rsi', 0)),
-                        'atr': float(h.get('atr', 0)),
-                        'atr_pct': float(h.get('atr_pct', 0)),
-                        'candle_pct': float(h.get('candle_pct', 0)),
-                        'trend_dist': float(h.get('trend_dist', 0)),
-                        'timestamp': fmt_time(h.get('entry_time', datetime.now())),
-                        'logged_at': fmt_time(h.get('entry_time', datetime.now())),
-                        'status': 'COMPLETED',
-                        'result': h.get('result', 'LOSS'),
-                        'pnl_pips': float(h.get('pnl_pips', 0)),
-                        'exit_price': float(h.get('exit', 0)),
-                        'exit_time': fmt_time(h.get('exit_time', datetime.now())),
-                        'hold_candles': int(h.get('hold_candles', 0)),
-                        'duration_min': float(h.get('duration_min', 0)),
-                    }
-                    st.session_state.signal_log.append(entry)
-                    st.session_state.active_signals[key] = entry
-
-        # Trim to max_log
-        st.session_state.signal_log = st.session_state.signal_log[-max_log:] if max_log else st.session_state.signal_log
-        p = STRATEGIES[strat_name]["params"].copy()
+    def build_scan_params(strategy_name: str) -> dict:
+        """Build params dict for a strategy, merging global param overrides from sidebar."""
+        p = STRATEGIES[strategy_name]["params"].copy()
         p.update({k: v for k, v in params.items() if k in p})
         return p
 
