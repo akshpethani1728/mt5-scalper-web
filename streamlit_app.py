@@ -56,6 +56,8 @@ def get_yf_ticker(pair: str) -> str:
     return PAIR_CONFIG.get(pair, {}).get("yf_ticker", pair)
 
 def get_pip_value(pair: str) -> float:
+    if pair is None:
+        return 0.0001
     return PAIR_CONFIG.get(pair, {}).get("pip", 0.0001)
 
 def is_jpy_pair(pair: str) -> bool:
@@ -659,6 +661,22 @@ def mt5_signal_file(symbol: str, signals: list) -> bytes:
     }
     return json.dumps(data, indent=2).encode('utf-8')
 
+def _serialize_trade(row: pd.Series) -> dict:
+    """Convert a trade row to a JSON-safe dict with all types coerced."""
+    out = {}
+    for k, v in row.items():
+        if isinstance(v, (np.integer,)):
+            out[k] = int(v)
+        elif isinstance(v, (np.floating,)):
+            out[k] = float(v)
+        elif isinstance(v, pd.Timestamp):
+            out[k] = str(v)
+        elif isinstance(v, (np.bool_,)):
+            out[k] = bool(v)
+        else:
+            out[k] = v
+    return out
+
 # ============================================================================
 # BACKTEST
 # ============================================================================
@@ -783,8 +801,8 @@ def run_backtest(symbol: str, candles: int, interval: str, strategy: str, params
         'duration_breakdown': dur_grp.to_dict('records'),
         'avg_duration_min': round(td['duration_min'].mean(), 1),
         'median_duration_min': round(td['duration_min'].median(), 1),
-        'best_trade': td.loc[td['pnl_pips'].idxmax()].to_dict() if len(td) > 0 else {},
-        'worst_trade': td.loc[td['pnl_pips'].idxmin()].to_dict() if len(td) > 0 else {},
+        'best_trade': _serialize_trade(td.loc[td['pnl_pips'].idxmax()]) if len(td) > 0 else {},
+        'worst_trade': _serialize_trade(td.loc[td['pnl_pips'].idxmin()]) if len(td) > 0 else {},
         'total_hours': round(len(df) / 60, 1),
         'recovery_factor': round(abs(total_pnl / max_dd), 2) if max_dd != 0 else '∞',
         'avg_trade_pnl': round(total_pnl / total, 2) if total > 0 else 0,
@@ -1008,56 +1026,6 @@ def tv_widget_html(symbol: str, interval: str = "M1") -> str:
         f"support_host=https://www.tradingview.com"
     )
     return f'<iframe src="{url}" width="100%" height="500" frameborder="0" allowtransparency="true" scrolling="no" style="border-radius:10px;border:1px solid #2a2a2a;" title="TV {symbol}"></iframe>'
-
-# ============================================================================
-# TRADINGVIEW DATA (for backtest — real OHLCV)
-# ============================================================================
-
-def fetch_tradingview_ohlcv(symbol: str, interval: str = "1", days: int = 30) -> pd.DataFrame:
-    """Fetch OHLCV from TradingView's public data API."""
-    # Map symbol to TradingView format
-    tv_sym_map = {
-        "EURUSD": "EURUSD", "GBPUSD": "GBPUSD", "USDJPY": "USDJPY",
-        "XAUUSD": "TVC:GOLD", "AUDUSD": "AUDUSD", "USDCAD": "USDCAD",
-        "NZDUSD": "NZDUSD", "GBPAUD": "GBPAUD",
-    }
-    tv_sym = tv_sym_map.get(symbol.upper(), symbol.upper())
-
-    # interval: 1=1m, 5=5m, 60=1h
-    iv = interval  # "1", "5", "60"
-
-    # TradingView v1 market data
-    url = f"https://scanner.tradingview.com/forex/scan"
-    # Try alternative: direct chart data
-    chart_url = f"https://charting-library.tradingview.com/symbols/{tv_sym.replace(':', '%3A')}/info"
-
-    # Use the public tradingview chart API
-    try:
-        # Method 1: get history via tradingview's public REST
-        hist_url = f"https://data.tradingview.com/symbols/{tv_sym}/history"
-        params = {"interval": iv, "from": int(pd.Timestamp.now().timestamp()) - days * 86400, "to": int(pd.Timestamp.now().timestamp()), "field": "close,open,high,low,volume"}
-        resp = requests.get(hist_url, params=params, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"}, timeout=10)
-        if resp.status_code == 200 and resp.text:
-            data = resp.json()
-            if isinstance(data, dict) and 't' in data:
-                ts = data['t']
-                return pd.DataFrame({
-                    "time": pd.to_datetime(ts, unit="s", utc=True).tz_convert(None),
-                    "open": data['o'], "high": data['h'],
-                    "low": data['l'], "close": data['c'],
-                    "volume": data['v'] if 'v' in data else [0]*len(ts),
-                }).dropna(subset=["close"]).assign(volume=lambda x: x['volume'].fillna(0))
-    except Exception:
-        pass
-
-    # Method 2: use tradingview's lightweight chart API
-    try:
-        lw_url = f"https://api.tradingview.com/v1/symbols/{tv_sym}/quotes"
-        resp = requests.get(lw_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
-    except Exception:
-        pass
-
-    return pd.DataFrame()
 
 
 def fetch_yf_history(symbol: str, interval: str = "1m", days: int = 5) -> pd.DataFrame:
@@ -1647,6 +1615,18 @@ with tab2:
             **📅 Timeframes**\nM1 (1 minute) — 500-3000 candles\nM5 (5 minute) — 500-3000 candles\nH1 (1 hour) — 500-3000 candles\n\n**🌐 Sessions**\nLondon: 08-12 UTC\nNew York: 13-17 UTC
             """)
 
+@st.cache_data(ttl=15, show_spinner=False)
+def get_live_prices(symbols_timeframes: list[tuple]) -> dict:
+    """Fetch latest close for each unique (symbol, tf) pair. Returns {symbol: price}."""
+    result = {}
+    for sym, tf in dict.fromkeys(symbols_timeframes).keys():
+        tf_int = TF_INTERVAL.get(tf, "1m")
+        df = get_candles(sym, tf_int, "5d", count=3)
+        if not df.empty:
+            result[sym] = df.iloc[-1]['close']
+    return result
+
+
 # ═══════════════════════════════════════════════════
 # TAB 3: SCANNER
 # ═══════════════════════════════════════════════════
@@ -1876,18 +1856,6 @@ with tab3:
 
     # ── LAST 5 SIGNALS FEED ───────────────────────────────────────────────
     st.markdown("#### 📜 Last 5 Signals")
-
-    # Fetch live prices for active signals so we can show live P&L
-    @st.cache_data(ttl=15, show_spinner=False)
-    def get_live_prices(symbols_timeframes: list[tuple]) -> dict:
-        """Fetch latest close for each unique (symbol, tf) pair. Returns {symbol: price}."""
-        result = {}
-        for sym, tf in dict.fromkeys(symbols_timeframes).keys():
-            tf_int = TF_INTERVAL.get(tf, "1m")
-            df = get_candles(sym, tf_int, "5d", count=3)
-            if not df.empty:
-                result[sym] = df.iloc[-1]['close']
-        return result
 
     live_prices = {}
     if active_sig:
