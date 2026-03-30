@@ -515,15 +515,19 @@ def scan_pair(symbol: str, interval: str, strategy: str, params: dict) -> dict |
         }
     return None
 
-def scan_pair_historical(symbol: str, interval: str, strategy: str, params: dict, max_trades: int = 3) -> list:
+def scan_pair_historical(symbol: str, interval: str, strategy: str, params: dict, max_trades: int = 10) -> list:
     """Scan recent candles and return the last N completed signals (non-overlapping)."""
     tf_int = TF_INTERVAL.get(interval, "1m")
     tf_rng = TF_PERIOD.get(interval, "5d")
-    df = get_candles(symbol, tf_int, tf_rng, count=300)
+    # Use 500 candles to maximize historical lookback; more candles = more completed trades
+    df = get_candles(symbol, tf_int, tf_rng, count=500)
     if df.empty or len(df) < 50:
         return []
     df = add_indicators(df, params)
     df = df.reset_index(drop=True)
+
+    # Disable session filter for historical scan so we get trades from all hours
+    scan_params = {**params, "_no_session_filter": True}
 
     signals_found = []
     position = None
@@ -531,7 +535,7 @@ def scan_pair_historical(symbol: str, interval: str, strategy: str, params: dict
 
     # Scan from lookback to near the end (don't use last 2 bars — they may be incomplete)
     for i in range(lookback, len(df) - 2):
-        direction = find_signal(df, i, strategy, params)
+        direction = find_signal(df, i, strategy, scan_params)
         if direction and position is None:
             score = score_signal(df, i, direction, params)
             if score >= params['min_score']:
@@ -1685,8 +1689,62 @@ with tab3:
         st.session_state.refresh_count = 0
     if "scan_paused" not in st.session_state:
         st.session_state.scan_paused = False
+    if "first_scan_done" not in st.session_state:
+        st.session_state.first_scan_done = False
 
-    def build_scan_params(strat_name):
+    # ── FIRST SCAN: pre-fill signal log with recent completed trades ──────────
+    # This runs once on first load so the scanner shows real data immediately
+    if not st.session_state.first_scan_done and not st.session_state.scan_paused:
+        st.session_state.first_scan_done = True
+        pairs_to_fill = st.session_state.selected_pairs or ALL_PAIRS[:4]
+
+        with st.spinner("📡 Loading historical trades..."):
+            for pair in pairs_to_fill:
+                if scan_mode_local == "Active Strategy":
+                    hist = scan_pair_historical(pair, scan_tf, active, build_scan_params(active), max_trades=10)
+                else:
+                    hist = []
+                    for strat in STRATEGIES.keys():
+                        h = scan_pair_historical(pair, scan_tf, strat, build_scan_params(strat), max_trades=5)
+                        hist.extend(h)
+                    hist.sort(key=lambda x: str(x.get('entry_time', '')), reverse=True)
+                    hist = hist[:10]
+
+                for h in hist:
+                    key = f"{h['symbol']}|{h['signal']}|{h.get('strategy','')}|{h.get('timeframe','')}"
+                    if key in st.session_state.active_signals:
+                        continue
+                    entry = {
+                        'id': key,
+                        'symbol': h['symbol'],
+                        'strategy': h.get('strategy', active),
+                        'timeframe': h.get('timeframe', scan_tf),
+                        'direction': h['signal'],
+                        'score': int(h.get('score', 0)),
+                        'rr': float(h.get('rr', 0)),
+                        'entry': float(h['entry']),
+                        'sl': float(h['sl']),
+                        'tp': float(h['tp']),
+                        'rsi': float(h.get('rsi', 0)),
+                        'atr': float(h.get('atr', 0)),
+                        'atr_pct': float(h.get('atr_pct', 0)),
+                        'candle_pct': float(h.get('candle_pct', 0)),
+                        'trend_dist': float(h.get('trend_dist', 0)),
+                        'timestamp': fmt_time(h.get('entry_time', datetime.now())),
+                        'logged_at': fmt_time(h.get('entry_time', datetime.now())),
+                        'status': 'COMPLETED',
+                        'result': h.get('result', 'LOSS'),
+                        'pnl_pips': float(h.get('pnl_pips', 0)),
+                        'exit_price': float(h.get('exit', 0)),
+                        'exit_time': fmt_time(h.get('exit_time', datetime.now())),
+                        'hold_candles': int(h.get('hold_candles', 0)),
+                        'duration_min': float(h.get('duration_min', 0)),
+                    }
+                    st.session_state.signal_log.append(entry)
+                    st.session_state.active_signals[key] = entry
+
+        # Trim to max_log
+        st.session_state.signal_log = st.session_state.signal_log[-max_log:] if max_log else st.session_state.signal_log
         p = STRATEGIES[strat_name]["params"].copy()
         p.update({k: v for k, v in params.items() if k in p})
         return p
